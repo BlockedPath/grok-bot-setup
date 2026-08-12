@@ -1,5 +1,14 @@
 # grok-bot-setup
 
+[![npm](https://img.shields.io/npm/v/grok-bot-setup?style=flat-square&color=cb3837)](https://www.npmjs.com/package/grok-bot-setup)
+[![npm downloads](https://img.shields.io/npm/dm/grok-bot-setup?style=flat-square&color=cb3837)](https://www.npmjs.com/package/grok-bot-setup)
+[![license](https://img.shields.io/npm/l/grok-bot-setup?style=flat-square&color=green)](LICENSE)
+[![node](https://img.shields.io/node/v/grok-bot-setup?style=flat-square)](https://www.npmjs.com/package/grok-bot-setup)
+[![platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS-blue?style=flat-square)](https://github.com/BlockedPath/grok-bot-setup)
+[![cli](https://img.shields.io/badge/cli-adapters-informational?style=flat-square)](https://github.com/BlockedPath/grok-bot-setup)
+[![bash](https://img.shields.io/badge/bash-4%2B-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://github.com/BlockedPath/grok-bot-setup)
+[![GitHub](https://img.shields.io/github/stars/BlockedPath/grok-bot-setup?style=flat-square&logo=github)](https://github.com/BlockedPath/grok-bot-setup)
+
 CLI to point **Grok Bot** at custom model providers — DeepSeek, Claude, Grok, OpenAI, OpenRouter, ChatGPT/Codex, or any OpenAI-compatible URL.
 
 ```bash
