@@ -1,0 +1,12 @@
+# Keep the published tarball small; package.json "files" is the allowlist.
+.git
+.gitignore
+.npmignore
+cliproxy-api
+grok-model-bridge
+**/logs
+**/.env
+**/.chatgpt-auth
+docs/*.html
+docs/index.html
+*.log

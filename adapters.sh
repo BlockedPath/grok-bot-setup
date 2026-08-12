@@ -11,16 +11,40 @@
 # Switching writes /home/box/sand-data/xai-inference.env and can restart the host.
 set -euo pipefail
 
-# Project root (directory containing this script)
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve script dir even when installed as an npm bin symlink
+_script_dir() {
+  local src="${BASH_SOURCE[0]}"
+  local dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+ROOT="$(_script_dir)"
+
 SAND_DATA="${SAND_DATA_ROOT:-$HOME/sand-data}"
 SAND_HOST="${SAND_HOST_DIR:-$HOME/sand-host}"
 ENV_FILE="${SAND_XAI_ENV_FILE:-$SAND_DATA/xai-inference.env}"
 SETTINGS_FILE="${SAND_SETTINGS_FILE:-$SAND_DATA/settings.json}"
 
-# Local runtime trees created by `install` (not shipped in the repo)
-CLIPROXY_DIR="${CLIPROXY_DIR:-$ROOT/cliproxy-api}"
-LITELLM_DIR="${LITELLM_DIR:-$ROOT/grok-model-bridge}"
+# Runtime trees from `install`. Prefer a stable home data dir (npm/npx safe);
+# fall back to next-to-script if that layout already exists (repo checkout).
+_adapters_data_dir() {
+  if [[ -n "${ADAPTERS_DATA:-}" ]]; then
+    printf '%s' "$ADAPTERS_DATA"
+    return
+  fi
+  if [[ -d "$ROOT/cliproxy-api" || -d "$ROOT/grok-model-bridge" ]]; then
+    printf '%s' "$ROOT"
+    return
+  fi
+  printf '%s' "${XDG_DATA_HOME:-$HOME/.local/share}/grok-bot-adapters"
+}
+ADAPTERS_DATA="$(_adapters_data_dir)"
+CLIPROXY_DIR="${CLIPROXY_DIR:-$ADAPTERS_DATA/cliproxy-api}"
+LITELLM_DIR="${LITELLM_DIR:-$ADAPTERS_DATA/grok-model-bridge}"
 CLIPROXY_BIN="${CLIPROXY_BIN:-$HOME/go/bin/server}"
 CLIPROXY_PORT="${CLIPROXY_PORT:-8317}"
 LITELLM_PORT="${LITELLM_PORT:-4000}"
@@ -1883,7 +1907,8 @@ SCRIPTABLE
   adapters.sh use deepseek              # prompts model + API key
   adapters.sh use claude                # prompts model + OAuth or Console key
 
-Docs: /workspace/setup/docs/GUIDE_CUSTOM_INFERENCE.md
+Docs: $ROOT/docs/GUIDE_CUSTOM_INFERENCE.md
+      (or https://github.com/BlockedPath/grok-bot-setup)
 EOF
 }
 

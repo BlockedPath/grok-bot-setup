@@ -8,6 +8,7 @@
 # Local runtime trees created by `adapters install` (not shipped)
 /cliproxy-api/
 /grok-model-bridge/
+node_modules/
 
 # Runtime / logs
 **/logs/*

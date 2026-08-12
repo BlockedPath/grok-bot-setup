@@ -1,0 +1,47 @@
+{
+  "name": "grok-bot-setup",
+  "version": "1.0.0",
+  "description": "CLI to point Grok Bot at custom model providers (DeepSeek, Claude, Grok, OpenAI, …)",
+  "keywords": [
+    "grok",
+    "xai",
+    "adapters",
+    "cli",
+    "llm",
+    "openai-compatible"
+  ],
+  "homepage": "https://github.com/BlockedPath/grok-bot-setup",
+  "bugs": {
+    "url": "https://github.com/BlockedPath/grok-bot-setup/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BlockedPath/grok-bot-setup.git"
+  },
+  "license": "MIT",
+  "author": "BlockedPath",
+  "type": "commonjs",
+  "bin": {
+    "adapters": "adapters.sh",
+    "grok-bot-setup": "adapters.sh"
+  },
+  "files": [
+    "adapters",
+    "adapters.sh",
+    "docs/GUIDE_CUSTOM_INFERENCE.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=14"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "preferGlobal": true,
+  "scripts": {
+    "adapters": "bash ./adapters.sh",
+    "prepack": "test -x adapters.sh"
+  }
+}
