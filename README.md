@@ -1,41 +1,161 @@
 # Grok Bot setup
 
-Interactive CLI and optional adapters to point Grok Bot at custom model providers
-(DeepSeek, Claude, Grok, OpenAI, …).
+Interactive CLI and optional adapters to point **Grok Bot** at custom model providers (DeepSeek, Claude, Grok, OpenAI, OpenRouter, ChatGPT/Codex OAuth, or any OpenAI-compatible URL).
 
-## Run
+It writes durable provider config, can start local proxies, and restarts the Sand host so Grok Bot picks up the new backend.
+
+## Prerequisites
+
+- A Sand / Grok Bot host environment (`~/sand-host`, `~/sand-data`)
+- `bash`, `curl`, `python3`
+- For optional adapters:
+  - **CLIProxyAPI** (Claude OAuth): Go toolchain
+  - **LiteLLM bridge**: [`uv`](https://docs.astral.sh/uv/)
+  - **openai-oauth** (ChatGPT/Codex): Node/`npx`
+
+## Install
+
+### 1. Clone
 
 ```bash
-/workspace/setup/adapters
-# or
-/workspace/setup/adapters.sh
+git clone https://github.com/BlockedPath/grok-bot-setup.git
+cd grok-bot-setup
 ```
 
-Shortcuts from workspace root (wrappers):
+On this box the tree often lives at `/workspace/setup`. Either path works; examples below use a local checkout named `grok-bot-setup`.
+
+### 2. Install adapters (and optional login CLIs)
 
 ```bash
-/workspace/adapters
-/workspace/scripts/adapters.sh
+# Install local proxies: CLIProxyAPI, LiteLLM, openai-oauth cache
+./adapters install all
+
+# Optional: install login CLIs (claude / grok / codex) if missing
+./adapters install login-agents
 ```
 
-## Layout
+Targets:
 
-| Path | Purpose |
-|------|---------|
-| `adapters.sh` | Interactive + scriptable CLI |
-| `adapters` | Launcher |
-| `cliproxy-api/` | Claude Pro/Max OAuth proxy (`:8317`) |
-| `grok-model-bridge/` | LiteLLM multi-provider bridge (`:4000`) |
-| `docs/` | Custom inference guide |
+| Command | What it installs |
+|---------|------------------|
+| `./adapters install all` | CLIProxy, LiteLLM, openai-oauth |
+| `./adapters install cliproxy` | Claude OAuth proxy binary + config |
+| `./adapters install litellm` | LiteLLM multi-provider bridge + `.env` |
+| `./adapters install openai-oauth` | Warm `npx openai-oauth` cache |
+| `./adapters install claude` / `grok` / `codex` | Provider login CLIs |
+| `./adapters install login-agents` | Any missing login CLIs |
+
+### 3. Log in where needed
+
+```bash
+claude login          # Claude Pro/Max OAuth (for CLIProxy)
+grok login            # Grok CLI session (~/.grok/auth.json)
+codex login           # ChatGPT/Codex OAuth (~/.codex/auth.json)
+```
+
+Check status anytime:
+
+```bash
+./adapters status
+./adapters check-logins
+```
+
+### 4. Start proxies (only if you need them)
+
+```bash
+./adapters start all
+# or individually:
+./adapters start cliproxy      # :8317 Claude OAuth
+./adapters start litellm       # :4000 LiteLLM
+./adapters start openai-oauth  # :10531 Codex/ChatGPT
+```
+
+Stop with `./adapters stop [all|cliproxy|litellm|openai-oauth]`.
+
+## Use
+
+### Interactive (recommended)
+
+```bash
+./adapters
+# same as:
+./adapters.sh
+./adapters menu
+```
+
+Menu:
+
+1. Status  
+2. Switch provider (DeepSeek / Claude / Grok / OpenAI / …)  
+3. Install adapters  
+4. Start adapters  
+5. Stop adapters  
+6. Restart host  
+7. Check / install login agents  
+8. Help  
+0. Quit  
+
+Each provider switch prompts for model/credentials as needed, writes config, then offers a host restart.
+
+### Scriptable one-liners
+
+```bash
+./adapters status
+./adapters use deepseek                 # prompts model + API key
+./adapters use claude                   # prompts model + OAuth or Console key
+./adapters use grok-session             # uses ~/.grok/auth.json
+./adapters use openai --key sk-... --model gpt-4o
+./adapters use openrouter --key sk-or-... --model openai/gpt-4o
+./adapters use xai-api --key xai-... --model grok-4.5
+./adapters use litellm --model grok
+./adapters use openai-oauth --model gpt-5.4-mini
+./adapters use direct --base-url https://example.com/v1 --model my-model --key KEY
+./adapters use cursor                   # back to stock Cursor inference
+./adapters restart-host
+```
+
+Common flags for `use`:
+
+- `--model ID` — skip the model prompt  
+- `--key KEY` — skip the API-key prompt (or use env vars like `OPENAI_API_KEY`)  
+- `--auth oauth|api_key` — Claude auth mode  
+
+### Provider profiles
+
+| Profile | Backend | Auth |
+|---------|---------|------|
+| `deepseek` | `api.deepseek.com` | DeepSeek API key |
+| `claude` / `cliproxy` | CLIProxy `:8317` or LiteLLM + Anthropic | `claude login` OAuth **or** Console API key |
+| `grok-session` / `grok` | Grok cli-chat-proxy | `grok login` session |
+| `xai-api` / `xai` | `api.x.ai` | xAI platform API key |
+| `openai` | OpenAI Platform | `OPENAI_API_KEY` |
+| `openrouter` | OpenRouter | `OPENROUTER_API_KEY` |
+| `litellm` / `bridge` | LiteLLM `:4000` | `LITELLM_MASTER_KEY` in `grok-model-bridge/.env` |
+| `openai-oauth` / `codex` | openai-oauth `:10531` | `codex login` |
+| `direct` | Any OpenAI-compatible URL | your key + base URL |
+| `cursor` / `stock` | Stock Cursor path | (disables custom provider) |
 
 ## What it configures
 
 Writes durable provider config:
 
 ```
-/home/box/sand-data/xai-inference.env
+~/sand-data/xai-inference.env
 ```
 
-and can restart the Sand host so Grok Bot picks up the new backend.
+and can update `~/sand-data/settings.json` and restart the Sand host so Grok Bot uses the new backend.
 
-See `docs/GUIDE_CUSTOM_INFERENCE.md` for full details.
+## Layout
+
+| Path | Purpose |
+|------|---------|
+| `adapters` / `adapters.sh` | Interactive + scriptable CLI |
+| `cliproxy-api/` | Claude Pro/Max OAuth proxy (`:8317`) |
+| `grok-model-bridge/` | LiteLLM multi-provider bridge (`:4000`) |
+| `docs/` | Full custom-inference guide |
+
+## Docs
+
+- Full runbook: [`docs/GUIDE_CUSTOM_INFERENCE.md`](docs/GUIDE_CUSTOM_INFERENCE.md)  
+- HTML guide: [`docs/GUIDE_CUSTOM_INFERENCE.html`](docs/GUIDE_CUSTOM_INFERENCE.html)  
+- CLI help: `./adapters help`
