@@ -1873,12 +1873,12 @@ cmd_menu() {
 
 # ── help ────────────────────────────────────────────────────────────────────
 cmd_help() {
-  cat <<'EOF'
+  cat <<EOF
 Grok Bot adapters CLI
 
 INTERACTIVE (default)
-  adapters.sh                 # full menu
-  adapters.sh menu
+  adapters                    # full menu
+  adapters menu
 
 MENU PATH
   1 Status
@@ -1896,19 +1896,20 @@ whether to install them (one-by-one). If installed but not logged in, it
 shows the login command.
 
 SCRIPTABLE
-  adapters.sh status
-  adapters.sh check-logins              # list login agent status
-  adapters.sh install [all|cliproxy|litellm|openai-oauth|claude|grok|codex|login-agents]
-  adapters.sh start   [all|cliproxy|litellm|openai-oauth]
-  adapters.sh stop    [all|cliproxy|litellm|openai-oauth]
-  adapters.sh use deepseek|claude|grok-session|openai|openrouter|…
-  adapters.sh restart-host
+  adapters status
+  adapters check-logins              # list login agent status
+  adapters install [all|cliproxy|litellm|openai-oauth|claude|grok|codex|login-agents]
+  adapters start   [all|cliproxy|litellm|openai-oauth]
+  adapters stop    [all|cliproxy|litellm|openai-oauth]
+  adapters use deepseek|claude|grok-session|openai|openrouter|…
+  adapters restart-host
 
-  adapters.sh use deepseek              # prompts model + API key
-  adapters.sh use claude                # prompts model + OAuth or Console key
+  adapters use deepseek              # prompts model + API key
+  adapters use claude                # prompts model + OAuth or Console key
 
-Docs: $ROOT/docs/GUIDE_CUSTOM_INFERENCE.md
-      (or https://github.com/BlockedPath/grok-bot-setup)
+Docs: ${ROOT}/docs/GUIDE_CUSTOM_INFERENCE.md
+      https://github.com/BlockedPath/grok-bot-setup
+npm:  npx grok-bot-setup   |   npm i -g grok-bot-setup
 EOF
 }
 
