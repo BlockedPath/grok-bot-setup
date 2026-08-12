@@ -130,8 +130,9 @@ Or just run **`adapters`** with no args for the interactive menu.
 
 ```bash
 adapters use deepseek --model deepseek-chat --key sk-...
-adapters use claude --model claude-sonnet-4-5 --auth oauth
+adapters use claude --model claude-opus-5 --oauth --thinking enabled --reasoning-effort medium
 adapters use claude --model claude-sonnet-4-5 --auth api_key --key sk-ant-...
+adapters use deepseek --thinking medium          # shorthand: enable + effort=medium
 adapters use openai --model gpt-4o --key sk-...
 adapters use direct --base-url https://example.com/v1 --model my-model --key KEY
 ```
@@ -139,6 +140,10 @@ adapters use direct --base-url https://example.com/v1 --model my-model --key KEY
 - `--model ID` — skip model prompt  
 - `--key KEY` — skip API-key prompt (or use env vars like `OPENAI_API_KEY`)  
 - `--auth oauth|api_key` — Claude auth mode  
+- `--thinking enabled|disabled` — model thinking / chain-of-thought (writes `SAND_XAI_THINKING`)  
+- `--reasoning-effort low|medium|high` — reasoning level (writes `SAND_XAI_REASONING_EFFORT`; implies thinking on)  
+- `--thinking medium` — shorthand for enabled + effort `medium` (also `low` / `high`)  
+
 
 ## What it writes
 

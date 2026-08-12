@@ -973,8 +973,15 @@ write_env_file() {
   local model="${WRITE_MODEL:-}"
   local key="${WRITE_API_KEY:-}"
   local thinking="${WRITE_THINKING:-disabled}"
+  # Prefer explicit WRITE_*; fall back to flags from parse_use_flags
+  local effort="${WRITE_REASONING_EFFORT:-${OPT_REASONING_EFFORT:-}}"
   local identity="${WRITE_IDENTITY:-1}"
   local comment="${WRITE_COMMENT:-Grok Bot custom inference}"
+
+  # If an effort is set, thinking must be on for the host to send reasoning_effort
+  if [[ -n "$effort" && "$thinking" != "enabled" && "$thinking" != "true" && "$thinking" != "1" ]]; then
+    thinking="enabled"
+  fi
 
   mkdir -p "$(dirname "$ENV_FILE")"
   umask 077
@@ -992,6 +999,9 @@ write_env_file() {
       echo "SAND_XAI_MODEL=${model}"
     fi
     echo "SAND_XAI_THINKING=${thinking}"
+    if [[ -n "$effort" ]]; then
+      echo "SAND_XAI_REASONING_EFFORT=${effort}"
+    fi
     echo "SAND_XAI_IDENTITY=${identity}"
   } >"$ENV_FILE"
   chmod 600 "$ENV_FILE" 2>/dev/null || true
@@ -1445,12 +1455,13 @@ claude_litellm_alias() {
 
 # ── use profiles ────────────────────────────────────────────────────────────
 parse_use_flags() {
-  # sets: OPT_MODEL OPT_KEY OPT_BASE OPT_NO_RESTART OPT_THINKING OPT_AUTH
+  # sets: OPT_MODEL OPT_KEY OPT_BASE OPT_NO_RESTART OPT_THINKING OPT_REASONING_EFFORT OPT_AUTH
   OPT_MODEL=""
   OPT_KEY=""
   OPT_BASE=""
   OPT_NO_RESTART=0
   OPT_THINKING="disabled"
+  OPT_REASONING_EFFORT=""
   OPT_AUTH="" # oauth | api_key (claude only)
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1458,6 +1469,9 @@ parse_use_flags() {
       --key) OPT_KEY="${2:-}"; shift 2 ;;
       --base-url|--base) OPT_BASE="${2:-}"; shift 2 ;;
       --thinking) OPT_THINKING="${2:-}"; shift 2 ;;
+      --reasoning-effort|--effort|--reasoning)
+        OPT_REASONING_EFFORT="${2:-}"; shift 2
+        ;;
       --auth) OPT_AUTH="${2:-}"; shift 2 ;;
       --oauth) OPT_AUTH="oauth"; shift ;;
       --api-key|--console) OPT_AUTH="api_key"; shift ;;
@@ -1466,6 +1480,37 @@ parse_use_flags() {
       *) die "unknown flag: $1" ;;
     esac
   done
+  normalize_thinking_flags
+}
+
+# Normalize --thinking / --reasoning-effort into host env values.
+# Accepts --thinking low|medium|high as shorthand for enabled + effort.
+normalize_thinking_flags() {
+  local t="${OPT_THINKING:-disabled}"
+  local t_lc
+  t_lc="$(printf '%s' "$t" | tr '[:upper:]' '[:lower:]')"
+  case "$t_lc" in
+    low|medium|high|minimal|max|xhigh|ultra)
+      OPT_REASONING_EFFORT="${OPT_REASONING_EFFORT:-$t_lc}"
+      OPT_THINKING="enabled"
+      ;;
+    enabled|true|1|on)
+      OPT_THINKING="enabled"
+      ;;
+    disabled|false|0|off|"")
+      OPT_THINKING="disabled"
+      ;;
+    *)
+      # pass through unknown tokens (host may understand them)
+      OPT_THINKING="$t_lc"
+      ;;
+  esac
+  if [[ -n "${OPT_REASONING_EFFORT:-}" ]]; then
+    OPT_REASONING_EFFORT="$(printf '%s' "$OPT_REASONING_EFFORT" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$OPT_THINKING" == "disabled" ]]; then
+      OPT_THINKING="enabled"
+    fi
+  fi
 }
 
 after_use() {
@@ -1906,6 +1951,17 @@ SCRIPTABLE
 
   adapters use deepseek              # prompts model + API key
   adapters use claude                # prompts model + OAuth or Console key
+  adapters use claude --model claude-opus-5 --oauth \\
+      --thinking enabled --reasoning-effort medium
+
+USE FLAGS
+  --model ID
+  --key KEY
+  --base-url URL
+  --auth oauth|api_key          (claude)
+  --thinking enabled|disabled   (or low|medium|high shorthand)
+  --reasoning-effort LEVEL      low|medium|high (sets SAND_XAI_REASONING_EFFORT)
+  --no-restart
 
 Docs: ${ROOT}/docs/GUIDE_CUSTOM_INFERENCE.md
       https://github.com/BlockedPath/grok-bot-setup
