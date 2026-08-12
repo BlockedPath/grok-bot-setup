@@ -1,0 +1,27 @@
+name: Documentation
+description: README, guide, or help-text improvements
+title: "[Docs]: "
+labels: ["documentation"]
+body:
+  - type: textarea
+    id: location
+    attributes:
+      label: Where
+      description: Which doc or command help is unclear?
+      placeholder: README Install section / adapters help / GUIDE_CUSTOM_INFERENCE.md
+    validations:
+      required: true
+
+  - type: textarea
+    id: issue
+    attributes:
+      label: What’s wrong or missing
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested improvement
+    validations:
+      required: false

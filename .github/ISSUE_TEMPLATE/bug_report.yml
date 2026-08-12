@@ -1,0 +1,97 @@
+name: Bug report
+description: Something is broken or unexpected in the adapters CLI
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. **Do not paste API keys, session tokens, or auth files.**
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong in one or two sentences?
+      placeholder: adapters use claude fails after host restart…
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps someone else can follow.
+      placeholder: |
+        1. npm install -g grok-bot-setup
+        2. adapters install cliproxy
+        3. adapters use claude
+        4. …
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include error messages (redact secrets).
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, install method, and CLI version if known.
+      placeholder: |
+        OS: Linux / macOS …
+        Install: npm global / npx / git clone / curl
+        Package: grok-bot-setup@x.y.z (or commit SHA)
+        bash: …
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: adapters status (optional)
+      description: Output of `adapters status` and/or `adapters check-logins` with secrets redacted.
+      render: shell
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider / profile involved
+      multiple: true
+      options:
+        - deepseek
+        - claude / cliproxy
+        - grok-session
+        - xai-api
+        - openai
+        - openrouter
+        - litellm
+        - openai-oauth / codex
+        - direct
+        - cursor / stock
+        - install / start / stop only
+        - other / not sure
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues for duplicates
+          required: true
+        - label: I redacted secrets from logs and screenshots
+          required: true

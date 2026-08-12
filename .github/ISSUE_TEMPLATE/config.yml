@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Full custom-inference guide
+    url: https://github.com/BlockedPath/grok-bot-setup/blob/main/docs/GUIDE_CUSTOM_INFERENCE.md
+    about: Long-form runbook for providers, host patching, and recovery
+  - name: npm package
+    url: https://www.npmjs.com/package/grok-bot-setup
+    about: Install with npm or npx

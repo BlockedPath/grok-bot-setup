@@ -156,3 +156,10 @@ Override the local data dir with `ADAPTERS_DATA=/path`.
 - CLI: `adapters help`
 - Repo: https://github.com/BlockedPath/grok-bot-setup
 - npm: https://www.npmjs.com/package/grok-bot-setup
+
+## Contributing
+
+- [Contributing guide](CONTRIBUTING.md)
+- [Code of conduct](CODE_OF_CONDUCT.md)
+- Bug / feature forms open automatically when you [file an issue](https://github.com/BlockedPath/grok-bot-setup/issues/new/choose)
+- PRs use [.github/PULL_REQUEST_TEMPLATE.md](.github/PULL_REQUEST_TEMPLATE.md)
