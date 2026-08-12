@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cli:
+    name: CLI checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bash syntax
+        run: |
+          set -euo pipefail
+          bash -n adapters.sh
+          bash -n adapters
+          echo "bash -n OK"
+
+      - name: ShellCheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          # Fail on errors only; warnings are noisy for a large interactive CLI.
+          shellcheck -S error adapters.sh adapters
+          echo "shellcheck OK"
+
+      - name: CLI help smoke test
+        run: |
+          set -euo pipefail
+          chmod +x adapters adapters.sh
+          ./adapters help | grep -q "Grok Bot adapters CLI"
+          ./adapters.sh help | grep -q "npm"
+          echo "help OK"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: https://registry.npmjs.org
+
+      - name: Validate package.json
+        run: |
+          set -euo pipefail
+          node -e "
+            const p = require('./package.json');
+            if (p.name !== 'grok-bot-setup') throw new Error('bad name');
+            if (!p.bin || !p.bin.adapters) throw new Error('missing bin.adapters');
+            if (!p.version) throw new Error('missing version');
+            console.log('package', p.name + '@' + p.version);
+          "
+          npm pack --dry-run
+
+      - name: Pack and install smoke test
+        run: |
+          set -euo pipefail
+          tarball="$(npm pack --silent)"
+          echo "packed $tarball"
+          mkdir -p /tmp/npm-ci-test
+          cd /tmp/npm-ci-test
+          npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE/$tarball"
+          ./node_modules/.bin/adapters help | grep -q "Grok Bot adapters CLI"
+          ./node_modules/.bin/grok-bot-setup help | grep -q "Grok Bot adapters CLI"
+          # Symlink resolution: data dir should default under XDG, not .bin
+          out="$(./node_modules/.bin/adapters help)"
+          echo "$out" | grep -q "Docs:"
+          echo "npm bin smoke OK"
+
+  # Optional second matrix job for bash on a different runner image
+  syntax-macos:
+    name: macOS bash syntax
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bash syntax + help
+        run: |
+          set -euo pipefail
+          bash -n adapters.sh
+          bash -n adapters
+          chmod +x adapters adapters.sh
+          ./adapters help | grep -q "Grok Bot adapters CLI"

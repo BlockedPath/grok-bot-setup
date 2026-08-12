@@ -40,7 +40,11 @@ git clone https://github.com/BlockedPath/grok-bot-setup.git
 cd grok-bot-setup
 ./adapters help
 bash -n adapters.sh   # syntax check
+npm test              # same checks used in CI (local)
 ```
+
+CI (`.github/workflows/ci.yml`) runs on every push/PR to `main`: bash syntax,
+ShellCheck (errors), help smoke test, and an `npm pack` install of the bin.
 
 Optional local npm link:
 

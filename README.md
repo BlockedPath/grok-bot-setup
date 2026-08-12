@@ -1,5 +1,6 @@
 # grok-bot-setup
 
+[![CI](https://img.shields.io/github/actions/workflow/status/BlockedPath/grok-bot-setup/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/BlockedPath/grok-bot-setup/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/grok-bot-setup?style=flat-square&color=cb3837)](https://www.npmjs.com/package/grok-bot-setup)
 [![npm downloads](https://img.shields.io/npm/dm/grok-bot-setup?style=flat-square&color=cb3837)](https://www.npmjs.com/package/grok-bot-setup)
 [![license](https://img.shields.io/npm/l/grok-bot-setup?style=flat-square&color=green)](LICENSE)

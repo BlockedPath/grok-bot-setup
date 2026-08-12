@@ -42,6 +42,7 @@
   "preferGlobal": true,
   "scripts": {
     "adapters": "bash ./adapters.sh",
-    "prepack": "test -x adapters.sh"
+    "prepack": "test -x adapters.sh",
+    "test": "bash -n adapters.sh && bash -n adapters && bash ./adapters.sh help >/dev/null"
   }
 }
