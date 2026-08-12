@@ -103,16 +103,21 @@ pause() {
 }
 
 current_provider_summary() {
-  local model="?" base="?" provider="?"
+  local model="?" base="?" provider="?" thinking="?" effort="?"
   if [[ -f "$ENV_FILE" ]]; then
     model="$(grep -E '^SAND_XAI_MODEL=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true)"
     base="$(grep -E '^SAND_XAI_BASE_URL=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true)"
     provider="$(grep -E '^SAND_INFERENCE_PROVIDER=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+    thinking="$(grep -E '^SAND_XAI_THINKING=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+    effort="$(grep -E '^SAND_XAI_REASONING_EFFORT=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true)"
   fi
   model="${model:-?}"
   base="${base:-(default / session)}"
   provider="${provider:-?}"
-  printf 'provider=%s  model=%s  base=%s' "$provider" "$model" "$base"
+  thinking="${thinking:-?}"
+  effort="${effort:-(none)}"
+  printf 'provider=%s  model=%s  effort=%s  thinking=%s  base=%s' \
+    "$provider" "$model" "$effort" "$thinking" "$base"
 }
 
 need_cmd() {
@@ -1011,24 +1016,190 @@ write_env_file() {
 
 patch_settings_model() {
   local model="$1"
+  local effort="${2:-}"
   [[ -f "$SETTINGS_FILE" ]] || return 0
-  python3 - "$SETTINGS_FILE" "$model" <<'PY'
+  python3 - "$SETTINGS_FILE" "$model" "$effort" <<'PY'
 import json, sys
-path, model = sys.argv[1], sys.argv[2]
+path, model, effort = sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else ""
 with open(path) as f:
     data = json.load(f)
 adm = data.get("agentDefaultModel") or {}
-adm["modelId"] = model
+if model:
+    adm["modelId"] = model
 if "maxMode" not in adm:
     adm["maxMode"] = True
-if "parameters" not in adm:
-    adm["parameters"] = []
+params = list(adm.get("parameters") or [])
+if effort:
+    params = [p for p in params if not (isinstance(p, dict) and p.get("id") in ("effort", "reasoning_effort"))]
+    params.append({"id": "effort", "value": effort})
+adm["parameters"] = params
 data["agentDefaultModel"] = adm
 with open(path, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
-print(f"updated agentDefaultModel.modelId -> {model}")
+msg = f"updated agentDefaultModel.modelId -> {model or adm.get('modelId')}"
+if effort:
+    msg += f" effort={effort}"
+print(msg)
 PY
+}
+
+# Upsert keys in existing xai-inference.env without wiping the rest
+upsert_env_keys() {
+  # usage: upsert_env_keys KEY=val KEY=val ...
+  python3 - "$ENV_FILE" "$@" <<'PY'
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+updates = {}
+for pair in sys.argv[2:]:
+    if "=" not in pair:
+        continue
+    k, _, v = pair.partition("=")
+    updates[k] = v
+lines = path.read_text().splitlines() if path.is_file() else []
+out = []
+seen = set()
+for line in lines:
+    raw = line.strip()
+    if not raw or raw.startswith("#") or "=" not in raw:
+        out.append(line)
+        continue
+    k, _, _ = raw.partition("=")
+    k = k.replace("export ", "").strip()
+    if k in updates:
+        out.append(f"{k}={updates[k]}")
+        seen.add(k)
+    else:
+        out.append(line)
+for k, v in updates.items():
+    if k not in seen:
+        out.append(f"{k}={v}")
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text("\n".join(out) + "\n")
+print(f"updated {path}")
+PY
+  chmod 600 "$ENV_FILE" 2>/dev/null || true
+}
+
+prompt_reasoning_effort() {
+  # prints effort or empty for disabled thinking
+  init_tty
+  local current=""
+  if [[ -f "$ENV_FILE" ]]; then
+    current="$(grep -E '^SAND_XAI_REASONING_EFFORT=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+  fi
+  {
+    echo
+    echo "Reasoning effort (Grok / thinking models):"
+    echo "  1) high     — best quality, solo hard tasks (default for Grok 4.6)"
+    echo "  2) medium   — safer for multi-agent / group chats  [recommended for groups]"
+    echo "  3) low      — faster, less thinking"
+    echo "  4) xhigh    — max effort (Grok 4.6+)"
+    echo "  5) off      — disable thinking (SAND_XAI_THINKING=disabled)"
+    if [[ -n "$current" ]]; then
+      echo "  6) keep current ($current)"
+    fi
+  } >"$_TTY_OUT"
+  local choice
+  choice="$(prompt_line "Choose" "${current:-1}")"
+  # allow typing the level directly
+  case "$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')" in
+    1|high|"") printf '%s' "high" ;;
+    2|medium|med) printf '%s' "medium" ;;
+    3|low) printf '%s' "low" ;;
+    4|xhigh|extra|max) printf '%s' "xhigh" ;;
+    5|off|disabled|none) printf '%s' "off" ;;
+    6|keep)
+      if [[ -n "$current" ]]; then printf '%s' "$current"
+      else printf '%s' "high"; fi
+      ;;
+    high|medium|low|xhigh|minimal) printf '%s' "$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')" ;;
+    *) die "invalid effort: $choice (high|medium|low|xhigh|off)" ;;
+  esac
+}
+
+# Interactive or scriptable: set effort on current provider (keeps model/base/key)
+cmd_set_effort() {
+  local effort="${1:-}"
+  local no_restart=0
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-restart) no_restart=1; shift ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+
+  if [[ -z "$effort" ]]; then
+    effort="$(prompt_reasoning_effort)"
+  fi
+  effort="$(printf '%s' "$effort" | tr '[:upper:]' '[:lower:]')"
+
+  local thinking="enabled"
+  local settings_effort="$effort"
+  case "$effort" in
+    off|disabled|none|false|0)
+      thinking="disabled"
+      settings_effort=""
+      # remove effort key by rewriting file carefully
+      if [[ -f "$ENV_FILE" ]]; then
+        upsert_env_keys "SAND_XAI_THINKING=disabled"
+        # drop REASONING_EFFORT line
+        python3 - "$ENV_FILE" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+lines = [ln for ln in p.read_text().splitlines() if not ln.strip().startswith("SAND_XAI_REASONING_EFFORT=")]
+p.write_text("\n".join(lines) + "\n")
+PY
+      else
+        WRITE_COMMENT="effort off" WRITE_PROVIDER=xai WRITE_MODEL="grok-4.6" \
+        WRITE_THINKING=disabled WRITE_REASONING_EFFORT="" write_env_file
+      fi
+      log "thinking=disabled (no reasoning_effort)"
+      ;;
+    high|medium|low|xhigh|minimal)
+      if [[ ! -f "$ENV_FILE" ]]; then
+        WRITE_COMMENT="Grok session + effort" WRITE_PROVIDER=xai WRITE_MODEL="grok-4.6" \
+        WRITE_THINKING=enabled WRITE_REASONING_EFFORT="$effort" write_env_file
+      else
+        upsert_env_keys "SAND_XAI_THINKING=enabled" "SAND_XAI_REASONING_EFFORT=$effort"
+      fi
+      log "thinking=enabled effort=$effort"
+      ;;
+    *) die "effort must be high|medium|low|xhigh|off (got: $effort)" ;;
+  esac
+
+  # Keep model id; patch effort in settings
+  local model=""
+  if [[ -f "$ENV_FILE" ]]; then
+    model="$(grep -E '^SAND_XAI_MODEL=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+  fi
+  model="${model:-grok-4.6}"
+  if [[ -n "$settings_effort" ]]; then
+    patch_settings_model "$model" "$settings_effort"
+  else
+    patch_settings_model "$model" ""
+  fi
+
+  log "current: $(current_provider_summary)"
+  sed -E 's/((KEY|TOKEN|SECRET|PASSWORD)=).*/\1***/' "$ENV_FILE" 2>/dev/null | sed 's/^/  /' || true
+
+  if [[ "$no_restart" -eq 1 ]]; then
+    warn "skipped host restart (--no-restart)"
+    return 0
+  fi
+  if [[ "$INTERACTIVE_MENU" -eq 1 ]]; then
+    local ans
+    ans="$(prompt_line "Restart host so effort applies now?" "Y")"
+    case "${ans,,}" in
+      y|yes|"") cmd_restart_host ;;
+      *) warn "restart later: adapters restart-host" ;;
+    esac
+  else
+    cmd_restart_host
+  fi
 }
 
 # ── host restart ────────────────────────────────────────────────────────────
@@ -1105,6 +1276,7 @@ for e in raw.split(b"\0"):
 for k in (
     "XAI_API_KEY", "GROK_CODE_XAI_API_KEY", "GROK_XAI_API_KEY",
     "SAND_XAI_BASE_URL", "SAND_XAI_MODEL", "SAND_XAI_THINKING",
+    "SAND_XAI_REASONING_EFFORT", "SAND_XAI_MAX_TOKENS", "SAND_XAI_PROMOTE_REASONING",
     "SAND_XAI_IDENTITY", "SAND_INFERENCE_PROVIDER", "OPENAI_API_KEY",
 ):
     env.pop(k, None)
@@ -1617,15 +1789,34 @@ cmd_use() {
 
     grok-session|grok)
       # Session auth: do NOT set XAI_API_KEY so module uses ~/.grok/auth.json
-      local model
+      local model effort
       if [[ -n "$OPT_MODEL" ]]; then model="$OPT_MODEL"
-      elif [[ "$INTERACTIVE_MENU" -eq 1 ]]; then model="$(prompt_line "Grok model id" "grok-4.5")"
-      else model="grok-4.5"; fi
+      elif [[ "$INTERACTIVE_MENU" -eq 1 ]]; then model="$(prompt_line "Grok model id" "grok-4.6")"
+      else model="grok-4.6"; fi
+      # Effort picker (interactive) or --effort flag
+      if [[ -z "${OPT_REASONING_EFFORT:-}" && "$INTERACTIVE_MENU" -eq 1 ]]; then
+        OPT_REASONING_EFFORT="$(prompt_reasoning_effort)"
+      fi
+      if [[ -z "${OPT_REASONING_EFFORT:-}" && -z "${OPT_THINKING:-}" ]]; then
+        # non-interactive default: high for Grok 4.6
+        OPT_REASONING_EFFORT="high"
+        OPT_THINKING="enabled"
+      fi
+      if [[ "${OPT_REASONING_EFFORT:-}" == "off" || "${OPT_REASONING_EFFORT:-}" == "disabled" ]]; then
+        OPT_THINKING="disabled"
+        OPT_REASONING_EFFORT=""
+      else
+        OPT_THINKING="enabled"
+      fi
+      normalize_thinking_flags
+      effort="${OPT_REASONING_EFFORT:-}"
       [[ -f "$HOME/.grok/auth.json" ]] || warn "no ~/.grok/auth.json — run: grok login"
+      log "Grok model=$model thinking=$OPT_THINKING effort=${effort:-(none)}"
       WRITE_COMMENT="Grok CLI session (cli-chat-proxy)" \
       WRITE_PROVIDER=xai WRITE_BASE_URL="" WRITE_MODEL="$model" WRITE_API_KEY="" \
+      WRITE_THINKING="$OPT_THINKING" WRITE_REASONING_EFFORT="$effort" \
         write_env_file
-      patch_settings_model "$model"
+      patch_settings_model "$model" "$effort"
       after_use
       ;;
 
@@ -1838,6 +2029,7 @@ cmd_menu() {
   OPT_BASE=""
   OPT_NO_RESTART=0
   OPT_THINKING="disabled"
+  OPT_REASONING_EFFORT=""
   OPT_AUTH=""
 
   # On launch: check login agents; if missing, ask to install
@@ -1853,12 +2045,13 @@ cmd_menu() {
       echo
       echo "  1) Status"
       echo "  2) Switch provider     ← DeepSeek, Claude, Grok, …"
-      echo "  3) Install adapters    (CLIProxy / LiteLLM / openai-oauth)"
-      echo "  4) Start adapters"
-      echo "  5) Stop adapters"
-      echo "  6) Restart Grok Bot host"
-      echo "  7) Check / install login agents  (claude, grok, codex, …)"
-      echo "  8) Help"
+      echo "  3) Reasoning effort    ← high / medium / low / xhigh / off"
+      echo "  4) Install adapters    (CLIProxy / LiteLLM / openai-oauth)"
+      echo "  5) Start adapters"
+      echo "  6) Stop adapters"
+      echo "  7) Restart Grok Bot host"
+      echo "  8) Check / install login agents  (claude, grok, codex, …)"
+      echo "  9) Help"
       echo "  0) Quit"
     } >"$t"
     choice="$(prompt_line "Choose" "1")"
@@ -1876,36 +2069,40 @@ cmd_menu() {
       2|switch|use)
         menu_switch_provider
         ;;
-      3|install)
+      3|effort|reasoning)
+        cmd_set_effort || true
+        pause
+        ;;
+      4|install)
         target="$(menu_pick_adapter_target)"
         if [[ -n "$target" ]]; then
           cmd_install "$target" || true
           pause
         fi
         ;;
-      4|start)
+      5|start)
         target="$(menu_pick_adapter_target)"
         if [[ -n "$target" ]]; then
           cmd_start "$target" || true
           pause
         fi
         ;;
-      5|stop)
+      6|stop)
         target="$(menu_pick_adapter_target)"
         if [[ -n "$target" ]]; then
           cmd_stop "$target" || true
           pause
         fi
         ;;
-      6|restart)
+      7|restart)
         cmd_restart_host || true
         pause
         ;;
-      7|logins|login-agents|check)
+      8|logins|login-agents|check)
         ensure_login_agents_interactive || true
         pause
         ;;
-      8|help|h)
+      9|help|h)
         cmd_help
         pause
         ;;
@@ -1928,12 +2125,13 @@ INTERACTIVE (default)
 MENU PATH
   1 Status
   2 Switch provider → DeepSeek / Claude / Grok / OpenAI / …
-  3 Install adapters (CLIProxy / LiteLLM / openai-oauth)
-  4 Start adapters
-  5 Stop adapters
-  6 Restart host
-  7 Check / install login agents (claude, grok, codex) — asks if missing
-  8 Help
+  3 Reasoning effort → high / medium / low / xhigh / off
+  4 Install adapters (CLIProxy / LiteLLM / openai-oauth)
+  5 Start adapters
+  6 Stop adapters
+  7 Restart host
+  8 Check / install login agents (claude, grok, codex)
+  9 Help
   0 Quit
 
 On launch, the menu scans for login agents. If any are missing, it asks
@@ -1942,17 +2140,18 @@ shows the login command.
 
 SCRIPTABLE
   adapters status
-  adapters check-logins              # list login agent status
+  adapters check-logins
+  adapters effort high|medium|low|xhigh|off [--no-restart]
   adapters install [all|cliproxy|litellm|openai-oauth|claude|grok|codex|login-agents]
   adapters start   [all|cliproxy|litellm|openai-oauth]
   adapters stop    [all|cliproxy|litellm|openai-oauth]
   adapters use deepseek|claude|grok-session|openai|openrouter|…
   adapters restart-host
 
-  adapters use deepseek              # prompts model + API key
-  adapters use claude                # prompts model + OAuth or Console key
-  adapters use claude --model claude-opus-5 --oauth \\
-      --thinking enabled --reasoning-effort medium
+  adapters use grok-session --model grok-4.6 --effort high
+  adapters use grok-session --model grok-4.6 --effort medium   # safer multi-agent
+  adapters effort medium                                        # change effort only
+  adapters use deepseek --model deepseek-v4-flash --key sk-... --no-restart
 
 USE FLAGS
   --model ID
@@ -1960,12 +2159,14 @@ USE FLAGS
   --base-url URL
   --auth oauth|api_key          (claude)
   --thinking enabled|disabled   (or low|medium|high shorthand)
-  --reasoning-effort LEVEL      low|medium|high (sets SAND_XAI_REASONING_EFFORT)
+  --effort / --reasoning-effort LEVEL   low|medium|high|xhigh
   --no-restart
 
+Host multi-agent safety (xai-prompt-session.cjs):
+  SAND_XAI_MAX_TOKENS=8192       # default completion cap (0 = omit)
+  SAND_XAI_PROMOTE_REASONING=0   # do not feed reasoning back as chat content
+
 Docs: ${ROOT}/docs/GUIDE_CUSTOM_INFERENCE.md
-      https://github.com/BlockedPath/grok-bot-setup
-npm:  npx grok-bot-setup   |   npm i -g grok-bot-setup
 EOF
 }
 
@@ -1985,6 +2186,7 @@ main() {
     help|-h|--help) cmd_help ;;
     status|st) cmd_status ;;
     check-logins|check|logins) cmd_check_login_agents ;;
+    effort|set-effort|reasoning-effort) cmd_set_effort "$@" ;;
     install) cmd_install "${1:-all}" ;;
     start) cmd_start "${1:-all}" ;;
     stop) cmd_stop "${1:-all}" ;;

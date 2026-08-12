@@ -96,6 +96,7 @@ Or just run **`adapters`** with no args for the interactive menu.
 | `adapters` | Interactive menu |
 | `adapters status` | Current provider + adapter ports |
 | `adapters check-logins` | Claude / Grok / Codex CLI login state |
+| `adapters effort high\|medium\|low\|xhigh\|off` | Set reasoning effort (restarts host) |
 | `adapters install [target]` | Download adapters or login CLIs |
 | `adapters start [target]` | Start local proxies |
 | `adapters stop [target]` | Stop local proxies |
@@ -131,8 +132,9 @@ Or just run **`adapters`** with no args for the interactive menu.
 ```bash
 adapters use deepseek --model deepseek-chat --key sk-...
 adapters use claude --model claude-opus-5 --oauth --thinking enabled --reasoning-effort medium
-adapters use claude --model claude-sonnet-4-5 --auth api_key --key sk-ant-...
-adapters use deepseek --thinking medium          # shorthand: enable + effort=medium
+adapters use grok-session --model grok-4.6 --effort high
+adapters use grok-session --model grok-4.6 --effort medium   # safer multi-agent / groups
+adapters effort medium                                       # change effort only
 adapters use openai --model gpt-4o --key sk-...
 adapters use direct --base-url https://example.com/v1 --model my-model --key KEY
 ```
@@ -141,9 +143,20 @@ adapters use direct --base-url https://example.com/v1 --model my-model --key KEY
 - `--key KEY` — skip API-key prompt (or use env vars like `OPENAI_API_KEY`)  
 - `--auth oauth|api_key` — Claude auth mode  
 - `--thinking enabled|disabled` — model thinking / chain-of-thought (writes `SAND_XAI_THINKING`)  
-- `--reasoning-effort low|medium|high` — reasoning level (writes `SAND_XAI_REASONING_EFFORT`; implies thinking on)  
+- `--effort` / `--reasoning-effort low|medium|high|xhigh` — writes `SAND_XAI_REASONING_EFFORT`  
 - `--thinking medium` — shorthand for enabled + effort `medium` (also `low` / `high`)  
+- `--no-restart` — write config without restarting the host  
 
+### Multi-agent safety (host module)
+
+Patched in `~/sand-host/xai-prompt-session.cjs`:
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `SAND_XAI_MAX_TOKENS` | `8192` | Cap completion length (`0` = omit) |
+| `SAND_XAI_PROMOTE_REASONING` | off | Do **not** re-inject reasoning as normal chat content (stops monologue loops) |
+
+For group chats prefer: `adapters effort medium`
 
 ## What it writes
 
