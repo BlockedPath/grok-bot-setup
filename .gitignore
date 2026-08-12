@@ -5,6 +5,10 @@
 *.pem
 *.key
 
+# Local runtime trees created by `adapters install` (not shipped)
+/cliproxy-api/
+/grok-model-bridge/
+
 # Runtime / logs
 **/logs/*
 !**/logs/.gitkeep

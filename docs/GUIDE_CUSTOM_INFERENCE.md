@@ -10,7 +10,7 @@
 | `XAI_GROK_BOT_FIXES.md` | Short log of the three bugs we hit |
 | `XAI_INFERENCE.md` | Compact env reference |
 | `GUIDE_CUSTOM_INFERENCE.html` | Same guide, rendered for the browser |
-| `/workspace/setup/grok-model-bridge/` | Optional LiteLLM multi-provider proxy |
+| `./grok-model-bridge/` (local, via `adapters install litellm`) | Optional LiteLLM multi-provider proxy |
 | `/home/box/sand-data/xai-inference.env` | Durable provider config loaded by the host module |
 
 ### Quick switch (adapters CLI)

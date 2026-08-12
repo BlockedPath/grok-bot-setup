@@ -11,13 +11,14 @@
 # Switching writes /home/box/sand-data/xai-inference.env and can restart the host.
 set -euo pipefail
 
-# This script lives in /workspace/setup/ (project root)
+# Project root (directory containing this script)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SAND_DATA="${SAND_DATA_ROOT:-$HOME/sand-data}"
 SAND_HOST="${SAND_HOST_DIR:-$HOME/sand-host}"
 ENV_FILE="${SAND_XAI_ENV_FILE:-$SAND_DATA/xai-inference.env}"
 SETTINGS_FILE="${SAND_SETTINGS_FILE:-$SAND_DATA/settings.json}"
 
+# Local runtime trees created by `install` (not shipped in the repo)
 CLIPROXY_DIR="${CLIPROXY_DIR:-$ROOT/cliproxy-api}"
 LITELLM_DIR="${LITELLM_DIR:-$ROOT/grok-model-bridge}"
 CLIPROXY_BIN="${CLIPROXY_BIN:-$HOME/go/bin/server}"
@@ -195,15 +196,7 @@ PY
 }
 
 # ── install ─────────────────────────────────────────────────────────────────
-install_cliproxy() {
-  log "install CLIProxyAPI"
-  need_cmd go
-  if [[ ! -x "$CLIPROXY_BIN" ]]; then
-    log "go install github.com/router-for-me/CLIProxyAPI/v6/cmd/server@latest"
-    GOBIN="$(dirname "$CLIPROXY_BIN")" go install github.com/router-for-me/CLIProxyAPI/v6/cmd/server@latest
-  else
-    log "binary already present: $CLIPROXY_BIN"
-  fi
+write_cliproxy_tree() {
   mkdir -p "$CLIPROXY_DIR/scripts" "$HOME/.cli-proxy-api"
   if [[ ! -f "$CLIPROXY_DIR/config.yaml" ]]; then
     cat >"$CLIPROXY_DIR/config.yaml" <<EOF
@@ -224,13 +217,267 @@ remote-management:
 EOF
     log "wrote $CLIPROXY_DIR/config.yaml"
   fi
-  if [[ ! -x "$CLIPROXY_DIR/scripts/start.sh" ]]; then
-    die "missing $CLIPROXY_DIR/scripts/start.sh — restore cliproxy-api tree"
+  cat >"$CLIPROXY_DIR/scripts/sync-claude-auth.sh" <<'EOF'
+#!/usr/bin/env bash
+# Sync Claude Code OAuth tokens into CLIProxyAPI auth-dir format.
+set -euo pipefail
+CREDS="${CLAUDE_CREDENTIALS:-$HOME/.claude/.credentials.json}"
+AUTH_DIR="${CLIPROXY_AUTH_DIR:-$HOME/.cli-proxy-api}"
+OUT="$AUTH_DIR/claude-pro-local.json"
+mkdir -p "$AUTH_DIR"
+python3 - "$CREDS" "$OUT" <<'PY'
+import json, sys
+from pathlib import Path
+from datetime import datetime, timezone
+creds_path, out_path = Path(sys.argv[1]), Path(sys.argv[2])
+creds = json.loads(creds_path.read_text())
+oauth = creds.get("claudeAiOauth") or creds
+if not oauth.get("accessToken"):
+    raise SystemExit(f"no accessToken in {creds_path}")
+expires_ms = oauth.get("expiresAt") or 0
+if expires_ms > 1e12:
+    exp = datetime.fromtimestamp(expires_ms / 1000, tz=timezone.utc)
+else:
+    exp = datetime.fromtimestamp(expires_ms, tz=timezone.utc) if expires_ms else datetime.now(timezone.utc)
+auth = {
+    "type": "claude",
+    "email": "claude-pro@local",
+    "access_token": oauth["accessToken"],
+    "refresh_token": oauth.get("refreshToken") or "",
+    "expired": exp.isoformat().replace("+00:00", "Z"),
+    "last_refresh": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "id_token": "",
+}
+out_path.write_text(json.dumps(auth, indent=2) + "\n")
+print(f"wrote {out_path} expires={auth['expired']}")
+PY
+EOF
+  cat >"$CLIPROXY_DIR/scripts/start.sh" <<EOF
+#!/usr/bin/env bash
+# Start CLIProxyAPI for Claude OAuth (Opus etc.) with tool support.
+set -euo pipefail
+ROOT="\$(cd "\$(dirname "\$0")/.." && pwd)"
+BIN="\${CLIPROXY_BIN:-\$HOME/go/bin/server}"
+CONFIG="\${CLIPROXY_CONFIG:-\$ROOT/config.yaml}"
+LOG="\${CLIPROXY_LOG:-/tmp/cliproxy.log}"
+PORT=${CLIPROXY_PORT}
+KEY="${CLIPROXY_KEY}"
+
+"\$ROOT/scripts/sync-claude-auth.sh"
+
+if [ ! -x "\$BIN" ]; then
+  echo "CLIProxyAPI binary not found at \$BIN" >&2
+  echo "Install: go install github.com/router-for-me/CLIProxyAPI/v6/cmd/server@latest" >&2
+  exit 1
+fi
+
+if command -v fuser >/dev/null 2>&1; then
+  fuser -k "\${PORT}/tcp" 2>/dev/null || true
+  sleep 0.3
+fi
+
+nohup "\$BIN" -config "\$CONFIG" >>"\$LOG" 2>&1 &
+echo "CLIProxyAPI pid \$! log \$LOG"
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  if curl -sf -m 1 -H "Authorization: Bearer \${KEY}" "http://127.0.0.1:\${PORT}/v1/models" >/dev/null; then
+    echo "listening on http://127.0.0.1:\${PORT}/v1"
+    exit 0
   fi
-  log "CLIProxyAPI install OK"
+  sleep 0.5
+done
+echo "failed to become ready; see \$LOG" >&2
+exit 1
+EOF
+  chmod +x "$CLIPROXY_DIR/scripts/start.sh" "$CLIPROXY_DIR/scripts/sync-claude-auth.sh"
+}
+
+install_cliproxy() {
+  log "install CLIProxyAPI"
+  need_cmd go
+  if [[ ! -x "$CLIPROXY_BIN" ]]; then
+    log "go install github.com/router-for-me/CLIProxyAPI/v6/cmd/server@latest"
+    GOBIN="$(dirname "$CLIPROXY_BIN")" go install github.com/router-for-me/CLIProxyAPI/v6/cmd/server@latest
+  else
+    log "binary already present: $CLIPROXY_BIN"
+  fi
+  write_cliproxy_tree
+  log "CLIProxyAPI install OK ($CLIPROXY_DIR)"
   if [[ ! -f "$HOME/.claude/.credentials.json" ]]; then
     warn "no Claude OAuth yet — run: claude login  (then: adapters.sh start cliproxy)"
   fi
+}
+
+write_litellm_tree() {
+  mkdir -p "$LITELLM_DIR/scripts" "$LITELLM_DIR/logs"
+  if [[ ! -f "$LITELLM_DIR/.env" ]]; then
+    cat >"$LITELLM_DIR/.env" <<EOF
+LITELLM_MASTER_KEY=${LITELLM_KEY_DEFAULT}
+
+# Grok auth: leave GROK_SESSION_TOKEN empty to auto-load from ~/.grok/auth.json
+# (created by \`grok login\`). Or set it explicitly:
+# GROK_SESSION_TOKEN=
+# GROK_AUTH_FILE=\$HOME/.grok/auth.json
+
+# Optional other backends
+ANTHROPIC_API_KEY=sk-ant-PLACEHOLDER
+GEMINI_API_KEY=PLACEHOLDER
+EOF
+    log "wrote $LITELLM_DIR/.env (edit API keys as needed)"
+  fi
+  if [[ ! -f "$LITELLM_DIR/config.yaml" ]]; then
+    cat >"$LITELLM_DIR/config.yaml" <<'EOF'
+model_list:
+  # Grok CLI session auth → cli-chat-proxy (primary)
+  # Token loaded from ~/.grok/auth.json by scripts/start.sh
+  - model_name: grok
+    litellm_params:
+      model: openai/grok-4.5
+      api_base: https://cli-chat-proxy.grok.com/v1
+      api_key: os.environ/GROK_SESSION_TOKEN
+      extra_headers:
+        X-XAI-Token-Auth: xai-grok-cli
+        x-grok-client-version: "1.0.0"
+        x-grok-model-override: grok-4.5
+        User-Agent: grok-cli/1.0.0
+
+  - model_name: grok-4.5
+    litellm_params:
+      model: openai/grok-4.5
+      api_base: https://cli-chat-proxy.grok.com/v1
+      api_key: os.environ/GROK_SESSION_TOKEN
+      extra_headers:
+        X-XAI-Token-Auth: xai-grok-cli
+        x-grok-client-version: "1.0.0"
+        x-grok-model-override: grok-4.5
+        User-Agent: grok-cli/1.0.0
+
+  # Anthropic Console API keys only (sk-ant-api…), NOT Claude Pro/Max OAuth.
+  - model_name: claude-opus-5
+    litellm_params:
+      model: anthropic/claude-opus-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: claude-sonnet
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: claude-sonnet-4-5
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: claude-sonnet-5
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: gemini-flash
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+litellm_settings:
+  drop_params: true
+  num_retries: 2
+  request_timeout: 120
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+EOF
+    log "wrote $LITELLM_DIR/config.yaml"
+  fi
+  cat >"$LITELLM_DIR/scripts/start.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+if [[ ! -f .env ]]; then
+  echo "Missing .env — run: adapters.sh install litellm" >&2
+  exit 1
+fi
+
+set -a
+# shellcheck disable=SC1091
+source .env
+set +a
+
+if [[ -z "${LITELLM_MASTER_KEY:-}" ]]; then
+  echo "LITELLM_MASTER_KEY is not set in .env" >&2
+  exit 1
+fi
+
+# Load Grok CLI session token from auth.json (from `grok login`) when present.
+GROK_AUTH_FILE="${GROK_AUTH_FILE:-$HOME/.grok/auth.json}"
+if [[ -z "${GROK_SESSION_TOKEN:-}" && -f "$GROK_AUTH_FILE" ]]; then
+  GROK_SESSION_TOKEN="$(
+    python3 - "$GROK_AUTH_FILE" <<'PY' || true
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text())
+except Exception:
+    sys.exit(0)
+entry = None
+for k, v in data.items():
+    if isinstance(v, dict) and v.get("key") and ("auth.x.ai" in k or v.get("auth_mode") == "oidc"):
+        entry = v
+        break
+if entry is None:
+    for v in data.values():
+        if isinstance(v, dict) and v.get("key"):
+            entry = v
+            break
+if not entry or not entry.get("key"):
+    sys.exit(0)
+expires = entry.get("expires_at")
+if expires:
+    try:
+        from datetime import datetime, timezone
+        exp = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+        secs = (exp - datetime.now(timezone.utc)).total_seconds()
+        if secs <= 0:
+            print("WARNING: Grok session token is expired; run: grok login", file=sys.stderr)
+        elif secs < 3600:
+            print(f"WARNING: Grok session token expires in {int(secs/60)}m", file=sys.stderr)
+    except Exception:
+        pass
+print(entry["key"], end="")
+PY
+  )"
+  export GROK_SESSION_TOKEN
+fi
+
+if [[ -z "${GROK_SESSION_TOKEN:-}" ]]; then
+  echo "WARNING: no GROK_SESSION_TOKEN — 'grok' alias will fail until: grok login" >&2
+  export GROK_SESSION_TOKEN="missing-grok-session-token"
+fi
+
+if command -v litellm >/dev/null 2>&1; then
+  LITELLM_BIN=(litellm)
+elif command -v uvx >/dev/null 2>&1; then
+  LITELLM_BIN=(uvx --from 'litellm[proxy]' litellm)
+elif [[ -x "$ROOT/.venv/bin/litellm" ]]; then
+  LITELLM_BIN=("$ROOT/.venv/bin/litellm")
+else
+  echo "litellm not found. Install with: adapters.sh install litellm" >&2
+  exit 1
+fi
+
+echo "Using Grok session auth from ${GROK_AUTH_FILE}"
+echo "Starting LiteLLM proxy on http://127.0.0.1:4000 ..."
+exec "${LITELLM_BIN[@]}" --config "$ROOT/config.yaml" --host 127.0.0.1 --port 4000
+EOF
+  chmod +x "$LITELLM_DIR/scripts/start.sh"
+  : >"$LITELLM_DIR/logs/.gitkeep" 2>/dev/null || true
 }
 
 install_litellm() {
@@ -242,24 +489,8 @@ install_litellm() {
   else
     log "litellm already on PATH: $(command -v litellm)"
   fi
-  mkdir -p "$LITELLM_DIR/scripts" "$LITELLM_DIR/logs"
-  if [[ ! -f "$LITELLM_DIR/.env" ]]; then
-    if [[ -f "$LITELLM_DIR/.env.example" ]]; then
-      cp "$LITELLM_DIR/.env.example" "$LITELLM_DIR/.env"
-    else
-      cat >"$LITELLM_DIR/.env" <<EOF
-LITELLM_MASTER_KEY=${LITELLM_KEY_DEFAULT}
-ANTHROPIC_API_KEY=sk-ant-PLACEHOLDER
-GEMINI_API_KEY=PLACEHOLDER
-EOF
-    fi
-    log "wrote $LITELLM_DIR/.env (edit API keys as needed)"
-  fi
-  if [[ ! -f "$LITELLM_DIR/config.yaml" ]]; then
-    die "missing $LITELLM_DIR/config.yaml — restore grok-model-bridge tree"
-  fi
-  chmod +x "$LITELLM_DIR/scripts/start.sh" 2>/dev/null || true
-  log "LiteLLM install OK — edit $LITELLM_DIR/.env for Anthropic/Gemini keys"
+  write_litellm_tree
+  log "LiteLLM install OK ($LITELLM_DIR) — edit .env for Anthropic/Gemini keys"
 }
 
 install_openai_oauth() {
@@ -588,7 +819,8 @@ start_cliproxy() {
     log "already listening on $CLIPROXY_PORT"
     return 0
   fi
-  [[ -x "$CLIPROXY_DIR/scripts/start.sh" ]] || die "missing $CLIPROXY_DIR/scripts/start.sh"
+  [[ -x "$CLIPROXY_BIN" ]] || die "CLIProxyAPI binary missing — run: adapters.sh install cliproxy"
+  write_cliproxy_tree
   "$CLIPROXY_DIR/scripts/start.sh"
 }
 
@@ -598,15 +830,20 @@ start_litellm() {
     log "already listening on $LITELLM_PORT"
     return 0
   fi
-  [[ -x "$LITELLM_DIR/scripts/start.sh" ]] || die "missing $LITELLM_DIR/scripts/start.sh"
+  write_litellm_tree
   # start.sh is exec; run detached
+  mkdir -p "$LITELLM_DIR/logs"
   : >"$LITELLM_DIR/logs/bridge.log"
   nohup "$LITELLM_DIR/scripts/start.sh" >>"$LITELLM_DIR/logs/bridge.log" 2>&1 &
-  if wait_http "http://127.0.0.1:${LITELLM_PORT}/v1/models" "${LITELLM_KEY_DEFAULT}" 30; then
+  local master="$LITELLM_KEY_DEFAULT"
+  if [[ -f "$LITELLM_DIR/.env" ]]; then
+    master="$(grep -E '^LITELLM_MASTER_KEY=' "$LITELLM_DIR/.env" | head -1 | cut -d= -f2- || true)"
+    master="${master:-$LITELLM_KEY_DEFAULT}"
+  fi
+  if wait_http "http://127.0.0.1:${LITELLM_PORT}/v1/models" "$master" 30; then
     log "LiteLLM ready http://127.0.0.1:${LITELLM_PORT}/v1"
   else
     warn "LiteLLM did not become ready — see $LITELLM_DIR/logs/bridge.log"
-    # If blocked on ChatGPT oauth or missing grok auth, surface last lines
     tail -20 "$LITELLM_DIR/logs/bridge.log" 2>/dev/null || true
     return 1
   fi

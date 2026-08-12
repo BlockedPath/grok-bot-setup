@@ -2,13 +2,13 @@
 
 Interactive CLI and optional adapters to point **Grok Bot** at custom model providers (DeepSeek, Claude, Grok, OpenAI, OpenRouter, ChatGPT/Codex OAuth, or any OpenAI-compatible URL).
 
-It writes durable provider config, can start local proxies, and restarts the Sand host so Grok Bot picks up the new backend.
+It writes durable provider config, can install/start local proxies, and restarts the Sand host so Grok Bot picks up the new backend.
 
 ## Prerequisites
 
 - A Sand / Grok Bot host environment (`~/sand-host`, `~/sand-data`)
 - `bash`, `curl`, `python3`
-- For optional adapters:
+- For optional adapters (downloaded by `./adapters install`):
   - **CLIProxyAPI** (Claude OAuth): Go toolchain
   - **LiteLLM bridge**: [`uv`](https://docs.astral.sh/uv/)
   - **openai-oauth** (ChatGPT/Codex): Node/`npx`
@@ -26,8 +26,10 @@ On this box the tree often lives at `/workspace/setup`. Either path works; examp
 
 ### 2. Install adapters (and optional login CLIs)
 
+`./adapters install` downloads binaries and scaffolds local runtime dirs (`cliproxy-api/`, `grok-model-bridge/`) next to the CLI. Those dirs are **not** in the repo.
+
 ```bash
-# Install local proxies: CLIProxyAPI, LiteLLM, openai-oauth cache
+# Download + scaffold: CLIProxyAPI, LiteLLM, openai-oauth cache
 ./adapters install all
 
 # Optional: install login CLIs (claude / grok / codex) if missing
@@ -38,9 +40,9 @@ Targets:
 
 | Command | What it installs |
 |---------|------------------|
-| `./adapters install all` | CLIProxy, LiteLLM, openai-oauth |
-| `./adapters install cliproxy` | Claude OAuth proxy binary + config |
-| `./adapters install litellm` | LiteLLM multi-provider bridge + `.env` |
+| `./adapters install all` | CLIProxy binary + config, LiteLLM + config, openai-oauth |
+| `./adapters install cliproxy` | Claude OAuth proxy binary and local tree (`:8317`) |
+| `./adapters install litellm` | LiteLLM proxy and local tree (`:4000`) |
 | `./adapters install openai-oauth` | Warm `npx openai-oauth` cache |
 | `./adapters install claude` / `grok` / `codex` | Provider login CLIs |
 | `./adapters install login-agents` | Any missing login CLIs |
@@ -130,7 +132,7 @@ Common flags for `use`:
 | `xai-api` / `xai` | `api.x.ai` | xAI platform API key |
 | `openai` | OpenAI Platform | `OPENAI_API_KEY` |
 | `openrouter` | OpenRouter | `OPENROUTER_API_KEY` |
-| `litellm` / `bridge` | LiteLLM `:4000` | `LITELLM_MASTER_KEY` in `grok-model-bridge/.env` |
+| `litellm` / `bridge` | LiteLLM `:4000` | master key in local `grok-model-bridge/.env` |
 | `openai-oauth` / `codex` | openai-oauth `:10531` | `codex login` |
 | `direct` | Any OpenAI-compatible URL | your key + base URL |
 | `cursor` / `stock` | Stock Cursor path | (disables custom provider) |
@@ -145,13 +147,18 @@ Writes durable provider config:
 
 and can update `~/sand-data/settings.json` and restart the Sand host so Grok Bot uses the new backend.
 
+Local install artifacts (gitignored):
+
+```
+./cliproxy-api/          # created by: adapters install cliproxy
+./grok-model-bridge/     # created by: adapters install litellm
+```
+
 ## Layout
 
 | Path | Purpose |
 |------|---------|
-| `adapters` / `adapters.sh` | Interactive + scriptable CLI |
-| `cliproxy-api/` | Claude Pro/Max OAuth proxy (`:8317`) |
-| `grok-model-bridge/` | LiteLLM multi-provider bridge (`:4000`) |
+| `adapters` / `adapters.sh` | Interactive + scriptable CLI (installs proxies on demand) |
 | `docs/` | Full custom-inference guide |
 
 ## Docs
