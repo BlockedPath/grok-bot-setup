@@ -7,6 +7,8 @@ npm install -g grok-bot-setup
 adapters
 ```
 
+![Grok Bot Inference Adapters interactive menu](docs/assets/adapters-menu.png)
+
 ## Install
 
 ### npm (recommended)
