@@ -1,0 +1,14 @@
+host: "127.0.0.1"
+port: 8317
+auth-dir: "~/.cli-proxy-api"
+api-keys:
+  - "sand-cliproxy"
+debug: true
+logging-to-file: false
+request-retry: 2
+disable-cooling: true
+ws-auth: false
+remote-management:
+  allow-remote: false
+  secret-key: ""
+  disable-control-panel: true

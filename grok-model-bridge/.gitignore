@@ -1,0 +1,6 @@
+.env
+.chatgpt-auth/
+__pycache__/
+.venv/
+logs/*
+!logs/.gitkeep

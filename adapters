@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Convenience launcher for the interactive adapters CLI.
+exec "$(cd "$(dirname "$0")" && pwd)/adapters.sh" "$@"

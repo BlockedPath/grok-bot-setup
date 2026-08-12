@@ -1,0 +1,24 @@
+# Secrets and local auth
+.env
+**/.env
+**/.chatgpt-auth/
+*.pem
+*.key
+
+# Runtime / logs
+**/logs/*
+!**/logs/.gitkeep
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
