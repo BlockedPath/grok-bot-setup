@@ -1,6 +1,6 @@
 {
   "name": "grok-bot-setup",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "CLI to point Grok Bot at custom model providers (DeepSeek, Claude, Grok, OpenAI, …)",
   "keywords": [
     "grok",
