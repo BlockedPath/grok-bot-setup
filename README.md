@@ -96,11 +96,13 @@ Or just run **`adapters`** with no args for the interactive menu.
 | `adapters` | Interactive menu |
 | `adapters status` | Current provider + adapter ports |
 | `adapters check-logins` | Claude / Grok / Codex CLI login state |
+| `adapters sync-claude [--refresh]` | Bidirectional Claude OAuth token sync (CLIProxy ↔ `claude login`) |
 | `adapters effort high\|medium\|low\|xhigh\|off` | Set reasoning effort (restarts host) |
 | `adapters install [target]` | Download adapters or login CLIs |
 | `adapters start [target]` | Start local proxies |
 | `adapters stop [target]` | Stop local proxies |
-| `adapters use <profile>` | Switch Grok Bot provider |
+| `adapters use <profile>` | Switch Grok Bot provider (also installs the host hook) |
+| `adapters patch-host` | Copy `xai-prompt-session.cjs` into `~/sand-host` and inject the createSession hook |
 | `adapters restart-host` | Restart Sand host to pick up config |
 | `adapters help` | Full help |
 
@@ -111,6 +113,9 @@ Or just run **`adapters`** with no args for the interactive menu.
 ### Start / stop targets
 
 `all` · `cliproxy` (`:8317`) · `litellm` (`:4000`) · `openai-oauth` (`:10531`)
+
+The cliproxy start now also launches a watchdog that keeps the proxy up and re-syncs
+Claude OAuth tokens every 60s (either side may rotate them and revoke the other's).
 
 ## Provider profiles (`adapters use …`)
 
@@ -147,9 +152,25 @@ adapters use direct --base-url https://example.com/v1 --model my-model --key KEY
 - `--thinking medium` — shorthand for enabled + effort `medium` (also `low` / `high`)  
 - `--no-restart` — write config without restarting the host  
 
+### Host hook (required)
+
+Stock Grok Bot ignores `xai-inference.env` until the host is patched. This repo ships:
+
+| File | Role |
+|------|------|
+| [`xai-prompt-session.cjs`](xai-prompt-session.cjs) | OpenAI-compatible inference session (CLIProxy / LiteLLM / xAI / …) |
+| [`scripts/ensure-xai-inference.sh`](scripts/ensure-xai-inference.sh) | Copies that module next to `host-main.cjs` and injects the createSession hook |
+
+`adapters use …` and `adapters restart-host` run the installer. After a host bundle upgrade:
+
+```bash
+adapters patch-host
+adapters restart-host
+```
+
 ### Multi-agent safety (host module)
 
-Patched in `~/sand-host/xai-prompt-session.cjs`:
+Shipped as `xai-prompt-session.cjs` and installed to `~/sand-host/xai-prompt-session.cjs`:
 
 | Env | Default | Meaning |
 |-----|---------|---------|

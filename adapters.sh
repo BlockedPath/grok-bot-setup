@@ -124,6 +124,18 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
 }
 
+# Some checkouts / copies land the Go binary as 0644. Restore +x if present.
+ensure_cliproxy_bin() {
+  if [[ -x "$CLIPROXY_BIN" ]]; then
+    return 0
+  fi
+  if [[ -f "$CLIPROXY_BIN" ]]; then
+    chmod +x "$CLIPROXY_BIN" 2>/dev/null || true
+    [[ -x "$CLIPROXY_BIN" ]] && return 0
+  fi
+  return 1
+}
+
 # ── process helpers (avoid pgrep -f self-match) ─────────────────────────────
 pids_matching() {
   # $1 = substring that must appear in cmdline
@@ -216,22 +228,60 @@ PY
 
   echo
   echo "=== install bits ==="
-  [[ -x "$CLIPROXY_BIN" ]] && echo "cliproxy bin: OK ($CLIPROXY_BIN)" || echo "cliproxy bin: MISSING ($CLIPROXY_BIN)"
+  ensure_cliproxy_bin && echo "cliproxy bin: OK ($CLIPROXY_BIN)" || echo "cliproxy bin: MISSING ($CLIPROXY_BIN)"
+  local pidfile="$CLIPROXY_DIR/scripts/watchdog.pid" pid
+  if [[ -f "$pidfile" ]] && pid="$(cat "$pidfile" 2>/dev/null || true)" && [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    echo "cliproxy watchdog: running (pid $pid)"
+  else
+    echo "cliproxy watchdog: not running"
+  fi
   command -v litellm >/dev/null 2>&1 && echo "litellm:     OK ($(command -v litellm))" || echo "litellm:     not on PATH (uvx fallback ok)"
   command -v npx >/dev/null 2>&1 && echo "npx:         OK" || echo "npx:         MISSING"
   [[ -f "$HOME/.claude/.credentials.json" ]] && echo "claude oauth: present" || echo "claude oauth: missing (claude login)"
   [[ -f "$HOME/.codex/auth.json" ]] && echo "codex oauth:  present" || echo "codex oauth:  missing (codex login)"
   [[ -f "$HOME/.grok/auth.json" ]] && echo "grok oauth:   present" || echo "grok oauth:   missing (grok login)"
+  local cp_auth_dir="${CLIPROXY_AUTH_DIR:-$HOME/.cli-proxy-api}"
+  if [[ -f "$cp_auth_dir/claude-pro-local.json" ]]; then
+    python3 - "$cp_auth_dir/claude-pro-local.json" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+try:
+    d = json.load(open(sys.argv[1]))
+    exp = d.get("expired") or ""
+    if exp:
+        t = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+        mins = (t - datetime.now(timezone.utc)).total_seconds() / 60
+        state = "OK" if mins > 0 else "EXPIRED"
+        print(f"claude token: {state} (expires in {int(mins)}m)")
+except Exception:
+    pass
+PY
+  fi
+  echo
+  echo "=== host inference hook ==="
+  if [[ -f "$SAND_HOST/xai-prompt-session.cjs" ]]; then
+    echo "session module: OK ($SAND_HOST/xai-prompt-session.cjs)"
+  else
+    echo "session module: MISSING ($SAND_HOST/xai-prompt-session.cjs)"
+    echo "  sand will ignore xai-inference.env until: adapters patch-host"
+  fi
+  if [[ -f "$SAND_HOST/host-main.cjs" ]] && grep -q createXaiPromptSession "$SAND_HOST/host-main.cjs"; then
+    echo "createSession hook: OK"
+  else
+    echo "createSession hook: MISSING — stock Cursor path is still active"
+    echo "  fix: adapters patch-host && adapters restart-host"
+  fi
 }
 
 # ── install ─────────────────────────────────────────────────────────────────
 write_cliproxy_tree() {
-  mkdir -p "$CLIPROXY_DIR/scripts" "$HOME/.cli-proxy-api"
+  local cp_auth_dir="${CLIPROXY_AUTH_DIR:-$HOME/.cli-proxy-api}"
+  mkdir -p "$CLIPROXY_DIR/scripts" "$cp_auth_dir"
   if [[ ! -f "$CLIPROXY_DIR/config.yaml" ]]; then
     cat >"$CLIPROXY_DIR/config.yaml" <<EOF
 host: "127.0.0.1"
 port: ${CLIPROXY_PORT}
-auth-dir: "~/.cli-proxy-api"
+auth-dir: "${cp_auth_dir}"
 api-keys:
   - "${CLIPROXY_KEY}"
 debug: true
@@ -239,75 +289,404 @@ logging-to-file: false
 request-retry: 2
 disable-cooling: true
 ws-auth: false
+streaming:
+  bootstrap-retries: 3
 remote-management:
   allow-remote: false
   secret-key: ""
   disable-control-panel: true
 EOF
     log "wrote $CLIPROXY_DIR/config.yaml"
+  elif ! grep -q '^streaming:' "$CLIPROXY_DIR/config.yaml" 2>/dev/null; then
+    # Upgrade older configs in place (auth retry before first streaming byte)
+    cat >>"$CLIPROXY_DIR/config.yaml" <<'EOF'
+streaming:
+  bootstrap-retries: 3
+EOF
+    log "added streaming.bootstrap-retries to $CLIPROXY_DIR/config.yaml"
   fi
+  # Bidirectional, freshest-wins sync between Claude Code OAuth credentials and
+  # CLIProxyAPI's auth file. Either side may rotate tokens (Claude Code CLI on
+  # use, CLIProxyAPI via its built-in auto-refresh), and every rotation revokes
+  # the other side's token — so the freshest token set must win in both files.
   cat >"$CLIPROXY_DIR/scripts/sync-claude-auth.sh" <<'EOF'
 #!/usr/bin/env bash
-# Sync Claude Code OAuth tokens into CLIProxyAPI auth-dir format.
+# Sync Claude Code OAuth tokens with CLIProxyAPI auth-dir (bidirectional).
+#
+# Both Claude Code (~/.claude/.credentials.json) and CLIProxyAPI can refresh the
+# OAuth token; each refresh rotates tokens and revokes what the other side
+# holds. This script copies the freshest token set into BOTH files and, when the
+# freshest access token is expired (or about to expire), refreshes it via
+# Anthropic's OAuth endpoint itself. Safe to run repeatedly (flock-guarded).
+#
+# Usage: sync-claude-auth.sh [--refresh | --no-refresh]
 set -euo pipefail
 CREDS="${CLAUDE_CREDENTIALS:-$HOME/.claude/.credentials.json}"
 AUTH_DIR="${CLIPROXY_AUTH_DIR:-$HOME/.cli-proxy-api}"
 OUT="$AUTH_DIR/claude-pro-local.json"
+LOCK="$AUTH_DIR/.claude-sync.lock"
+FORCE_REFRESH="no"
+case "${1:-}" in
+  --refresh|--force) FORCE_REFRESH="yes" ;;
+  --no-refresh) FORCE_REFRESH="never" ;;
+  "") ;;
+  *) echo "usage: $(basename "$0") [--refresh|--no-refresh]" >&2; exit 2 ;;
+esac
 mkdir -p "$AUTH_DIR"
-python3 - "$CREDS" "$OUT" <<'PY'
-import json, sys
-from pathlib import Path
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "sync-claude-auth: python3 not found" >&2
+  exit 1
+fi
+
+FORCE_REFRESH="$FORCE_REFRESH" REFRESH_AHEAD="${CLAUDE_REFRESH_AHEAD:-300}" \
+  python3 - "$CREDS" "$OUT" "$LOCK" <<'PY'
+import fcntl, json, os, sys, time, urllib.error, urllib.request
 from datetime import datetime, timezone
-creds_path, out_path = Path(sys.argv[1]), Path(sys.argv[2])
-creds = json.loads(creds_path.read_text())
-oauth = creds.get("claudeAiOauth") or creds
-if not oauth.get("accessToken"):
-    raise SystemExit(f"no accessToken in {creds_path}")
-expires_ms = oauth.get("expiresAt") or 0
-if expires_ms > 1e12:
-    exp = datetime.fromtimestamp(expires_ms / 1000, tz=timezone.utc)
-else:
-    exp = datetime.fromtimestamp(expires_ms, tz=timezone.utc) if expires_ms else datetime.now(timezone.utc)
-auth = {
-    "type": "claude",
-    "email": "claude-pro@local",
-    "access_token": oauth["accessToken"],
-    "refresh_token": oauth.get("refreshToken") or "",
-    "expired": exp.isoformat().replace("+00:00", "Z"),
-    "last_refresh": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    "id_token": "",
-}
-out_path.write_text(json.dumps(auth, indent=2) + "\n")
-print(f"wrote {out_path} expires={auth['expired']}")
+from pathlib import Path
+
+creds_path, out_path, lock_path = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+force = os.environ.get("FORCE_REFRESH", "no")
+try:
+    refresh_ahead = float(os.environ.get("REFRESH_AHEAD", "300"))
+except ValueError:
+    refresh_ahead = 300.0
+
+# Same endpoint + public client_id CLIProxyAPI v6 uses for OAuth refresh.
+TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def parse_ms(value):
+    if value is None:
+        return 0
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if v <= 0:
+        return 0
+    return int(v * 1000) if v < 1e12 else int(v)
+
+
+def parse_rfc3339(value):
+    if not value:
+        return 0
+    try:
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError:
+        return 0
+
+
+def atomic_write(path, text):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def http_json(url, payload, timeout=30):
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        try:
+            return e.code, json.loads(body)
+        except Exception:
+            return e.code, {"error": body}
+    except Exception as e:
+        return 0, {"error": str(e)}
+
+
+def read_creds():
+    """Returns (creds_dict, oauth_dict) or None."""
+    if not creds_path.is_file():
+        return None
+    try:
+        data = json.loads(creds_path.read_text())
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    oauth = data.get("claudeAiOauth")
+    if isinstance(oauth, dict) and oauth.get("accessToken"):
+        return data, oauth
+    if data.get("accessToken"):
+        return data, data
+    return None
+
+
+def read_auth_file():
+    if not out_path.is_file():
+        return None
+    try:
+        data = json.loads(out_path.read_text())
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not (data.get("access_token") or data.get("refresh_token")):
+        return None
+    return data
+
+
+def oauth_expiry_ms(oauth):
+    if oauth.get("expiresAt") is not None:
+        return parse_ms(oauth.get("expiresAt"))
+    return parse_rfc3339(oauth.get("expired"))
+
+
+def write_auth_file(at, rt, exp_ms, email):
+    payload = {
+        "type": "claude",
+        "email": email,
+        "access_token": at,
+        "refresh_token": rt or "",
+        "expired": datetime.fromtimestamp(exp_ms / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+        "last_refresh": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "id_token": "",
+    }
+    atomic_write(out_path, json.dumps(payload, indent=2) + "\n")
+
+
+def write_creds(creds, oauth, at, rt, exp_ms):
+    # Preserve every unrelated field; only touch the token fields.
+    orig_exp = oauth.get("expiresAt")
+    in_seconds = isinstance(orig_exp, (int, float)) and 0 < orig_exp < 1e12
+    oauth["accessToken"] = at
+    oauth["refreshToken"] = rt
+    oauth["expiresAt"] = exp_ms / 1000.0 if in_seconds else exp_ms
+    rt_exp = oauth.get("refreshTokenExpiresAt")
+    if rt_exp:
+        # Anthropic rotates the refresh token on every refresh with a fresh
+        # ~30d window; keep the CLI's expiry estimate in line with it.
+        rt_seconds = isinstance(rt_exp, (int, float)) and 0 < rt_exp < 1e12
+        rt_exp_ms = exp_ms + 29 * 24 * 3600 * 1000
+        oauth["refreshTokenExpiresAt"] = rt_exp_ms / 1000.0 if rt_seconds else rt_exp_ms
+    if isinstance(creds.get("claudeAiOauth"), dict):
+        creds["claudeAiOauth"] = oauth
+    atomic_write(creds_path, json.dumps(creds, indent=2) + "\n")
+
+
+def do_refresh(rt):
+    status, data = http_json(
+        TOKEN_URL,
+        {"client_id": CLIENT_ID, "grant_type": "refresh_token", "refresh_token": rt},
+    )
+    if status != 200 or not isinstance(data, dict) or not data.get("access_token"):
+        err = ""
+        if isinstance(data, dict):
+            err = data.get("error_description") or data.get("error") or json.dumps(data)
+        return None, str(err or f"HTTP {status}")
+    at = data["access_token"]
+    new_rt = data.get("refresh_token") or rt
+    expires_in = int(data.get("expires_in") or 3600)
+    acc = data.get("account") or {}
+    email = acc.get("email_address") if isinstance(acc, dict) else ""
+    return (at, new_rt, now_ms() + expires_in * 1000, email), None
+
+
+def iso(exp_ms):
+    return datetime.fromtimestamp(exp_ms / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def main():
+    # Serialize concurrent syncs so a refresh never races itself.
+    with open(lock_path, "w") as lf:
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("sync-claude-auth: another sync is running, skipping")
+            return 0
+
+        creds_entry = read_creds()
+        auth_entry = read_auth_file()
+
+        if creds_entry is None and auth_entry is None:
+            print(f"sync-claude-auth: no Claude credentials ({creds_path}) — run: claude login")
+            return 0
+
+        if creds_entry is not None:
+            creds, oauth = creds_entry
+            c_at, c_rt = oauth.get("accessToken") or "", oauth.get("refreshToken") or ""
+            c_exp = oauth_expiry_ms(oauth)
+            c_email = oauth.get("emailAddress") or oauth.get("email") or "claude-pro@local"
+        else:
+            creds, oauth, c_at, c_rt, c_exp, c_email = None, None, "", "", 0, "claude-pro@local"
+
+        if auth_entry is not None:
+            a_at = auth_entry.get("access_token") or ""
+            a_rt = auth_entry.get("refresh_token") or ""
+            a_exp = parse_rfc3339(auth_entry.get("expired"))
+            a_email = auth_entry.get("email") or "claude-pro@local"
+        else:
+            a_at, a_rt, a_exp, a_email = "", "", 0, "claude-pro@local"
+
+        # Later access-token expiry => the token set that was rotated most
+        # recently, i.e. the one still valid on both sides.
+        if c_at and (c_exp > a_exp or not a_at):
+            at, rt, email, exp_ms = c_at, c_rt, c_email, c_exp
+        elif a_at:
+            at, rt, email, exp_ms = a_at, a_rt, a_email, a_exp
+        else:
+            print("sync-claude-auth: no usable tokens found — run: claude login")
+            return 1
+
+        refreshed = False
+        near_expiry = exp_ms and exp_ms - now_ms() < refresh_ahead * 1000
+        if rt and force == "yes" or (force == "no" and near_expiry and rt):
+            result, err = do_refresh(rt)
+            if result is not None:
+                at, rt, exp_ms, new_email = result
+                email = new_email or email
+                refreshed = True
+                print(f"sync-claude-auth: refreshed OAuth token (expires {iso(exp_ms)})")
+            else:
+                print(f"sync-claude-auth: refresh failed: {err} — run 'claude login' if this persists")
+
+        # Converge both files on the freshest token set.
+        if auth_entry is None or a_at != at or a_rt != rt:
+            write_auth_file(at, rt, exp_ms, email)
+            print(f"sync-claude-auth: wrote {out_path}")
+        if creds is not None and (c_at != at or c_rt != rt):
+            write_creds(creds, oauth, at, rt, exp_ms)
+            print(f"sync-claude-auth: wrote {creds_path}")
+
+        state = "refreshed" if refreshed else "in sync"
+        print(f"sync-claude-auth: {state}, access token expires {iso(exp_ms)}")
+        return 0
+
+
+sys.exit(main())
 PY
+EOF
+  # Watchdog: keeps the server up and re-syncs tokens while it runs.
+  cat >"$CLIPROXY_DIR/scripts/watchdog.sh" <<'EOF'
+#!/usr/bin/env bash
+# CLIProxyAPI watchdog: keep the server alive and Claude OAuth tokens synced.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN="${CLIPROXY_BIN:-$HOME/go/bin/server}"
+CONFIG="${CLIPROXY_CONFIG:-$ROOT/config.yaml}"
+LOG="${CLIPROXY_LOG:-/tmp/cliproxy.log}"
+PORT="${CLIPROXY_PORT:-8317}"
+KEY="${CLIPROXY_KEY:-sand-cliproxy}"
+CHECK_INTERVAL="${CLIPROXY_CHECK_INTERVAL:-10}"
+SYNC_INTERVAL="${CLIPROXY_SYNC_INTERVAL:-60}"
+PIDFILE="$ROOT/scripts/watchdog.pid"
+SERVER_PIDFILE="$ROOT/scripts/server.pid"
+
+wlog() { echo "watchdog: $(date -u +%FT%TZ) $*" >>"$LOG"; }
+
+echo $$ >"$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT
+
+sync_auth() {
+  "$ROOT/scripts/sync-claude-auth.sh" >>"$LOG" 2>&1 || true
+}
+
+is_ready() {
+  curl -sf -m 2 -H "Authorization: Bearer $KEY" \
+    "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1
+}
+
+start_server() {
+  if [[ ! -x "$BIN" && -f "$BIN" ]]; then
+    chmod +x "$BIN" 2>/dev/null || true
+  fi
+  if [[ ! -x "$BIN" ]]; then
+    wlog "binary missing at $BIN — run: adapters.sh install cliproxy"
+    return 1
+  fi
+  wlog "starting server"
+  nohup "$BIN" -config "$CONFIG" >>"$LOG" 2>&1 &
+  echo $! >"$SERVER_PIDFILE"
+  return 0
+}
+
+wlog "started (check=${CHECK_INTERVAL}s sync=${SYNC_INTERVAL}s)"
+sync_auth
+if ! is_ready; then
+  start_server || true
+fi
+
+last_sync="$(date +%s)"
+fails=0
+while true; do
+  sleep "$CHECK_INTERVAL"
+  now="$(date +%s)"
+
+  if ! is_ready; then
+    # Token may have been revoked by a Claude Code CLI refresh; resync first,
+    # then restart the server only if it is genuinely down.
+    sync_auth
+    sleep 1
+    if ! is_ready; then
+      fails=$((fails + 1))
+      if [[ "$fails" -le 3 ]]; then
+        start_server || true
+      else
+        wlog "server down after 3 attempts; backing off 60s"
+        sleep 60
+        fails=0
+      fi
+    else
+      fails=0
+    fi
+  fi
+
+  if (( now - last_sync >= SYNC_INTERVAL )); then
+    sync_auth
+    last_sync="$now"
+  fi
+done
 EOF
   cat >"$CLIPROXY_DIR/scripts/start.sh" <<EOF
 #!/usr/bin/env bash
 # Start CLIProxyAPI for Claude OAuth (Opus etc.) with tool support.
+# Ensures the watchdog is running; it supervises the server and keeps the
+# Claude OAuth token synced bidirectionally while the proxy is up.
 set -euo pipefail
 ROOT="\$(cd "\$(dirname "\$0")/.." && pwd)"
 BIN="\${CLIPROXY_BIN:-\$HOME/go/bin/server}"
-CONFIG="\${CLIPROXY_CONFIG:-\$ROOT/config.yaml}"
 LOG="\${CLIPROXY_LOG:-/tmp/cliproxy.log}"
-PORT=${CLIPROXY_PORT}
-KEY="${CLIPROXY_KEY}"
+PORT="\${CLIPROXY_PORT:-${CLIPROXY_PORT}}"
+KEY="\${CLIPROXY_KEY:-${CLIPROXY_KEY}}"
+PIDFILE="\$ROOT/scripts/watchdog.pid"
 
-"\$ROOT/scripts/sync-claude-auth.sh"
+"\$ROOT/scripts/sync-claude-auth.sh" || true
 
+if [ ! -x "\$BIN" ] && [ -f "\$BIN" ]; then
+  chmod +x "\$BIN" 2>/dev/null || true
+fi
 if [ ! -x "\$BIN" ]; then
   echo "CLIProxyAPI binary not found at \$BIN" >&2
   echo "Install: go install github.com/router-for-me/CLIProxyAPI/v6/cmd/server@latest" >&2
   exit 1
 fi
 
-if command -v fuser >/dev/null 2>&1; then
-  fuser -k "\${PORT}/tcp" 2>/dev/null || true
-  sleep 0.3
+if [ -f "\$PIDFILE" ] && kill -0 "\$(cat "\$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+  echo "watchdog already running (pid \$(cat "\$PIDFILE"))"
+else
+  rm -f "\$PIDFILE"
+  nohup "\$ROOT/scripts/watchdog.sh" >>"\$LOG" 2>&1 &
+  echo "watchdog pid \$! log \$LOG"
 fi
 
-nohup "\$BIN" -config "\$CONFIG" >>"\$LOG" 2>&1 &
-echo "CLIProxyAPI pid \$! log \$LOG"
-for i in 1 2 3 4 5 6 7 8 9 10; do
+for i in \$(seq 1 30); do
   if curl -sf -m 1 -H "Authorization: Bearer \${KEY}" "http://127.0.0.1:\${PORT}/v1/models" >/dev/null; then
     echo "listening on http://127.0.0.1:\${PORT}/v1"
     exit 0
@@ -317,17 +696,19 @@ done
 echo "failed to become ready; see \$LOG" >&2
 exit 1
 EOF
-  chmod +x "$CLIPROXY_DIR/scripts/start.sh" "$CLIPROXY_DIR/scripts/sync-claude-auth.sh"
+  chmod +x "$CLIPROXY_DIR/scripts/start.sh" "$CLIPROXY_DIR/scripts/sync-claude-auth.sh" "$CLIPROXY_DIR/scripts/watchdog.sh"
 }
 
 install_cliproxy() {
   log "install CLIProxyAPI"
   need_cmd go
-  if [[ ! -x "$CLIPROXY_BIN" ]]; then
+  if ensure_cliproxy_bin; then
+    log "binary already present: $CLIPROXY_BIN"
+  else
     log "go install github.com/router-for-me/CLIProxyAPI/v6/cmd/server@latest"
     GOBIN="$(dirname "$CLIPROXY_BIN")" go install github.com/router-for-me/CLIProxyAPI/v6/cmd/server@latest
-  else
-    log "binary already present: $CLIPROXY_BIN"
+    chmod +x "$CLIPROXY_BIN" 2>/dev/null || true
+    ensure_cliproxy_bin || die "CLIProxyAPI install did not produce an executable at $CLIPROXY_BIN"
   fi
   write_cliproxy_tree
   log "CLIProxyAPI install OK ($CLIPROXY_DIR)"
@@ -585,7 +966,7 @@ login_agent_status_line() {
       fi
       ;;
     cliproxy)
-      if [[ -x "$CLIPROXY_BIN" ]]; then
+      if ensure_cliproxy_bin; then
         echo "OK|CLIProxy binary $CLIPROXY_BIN"
       else
         echo "MISS|CLIProxy binary missing"
@@ -842,15 +1223,34 @@ cmd_install() {
 }
 
 # ── start / stop ────────────────────────────────────────────────────────────
+cliproxy_watchdog_alive() {
+  local pidfile="$CLIPROXY_DIR/scripts/watchdog.pid" pid
+  [[ -f "$pidfile" ]] || return 1
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
 start_cliproxy() {
   log "start CLIProxyAPI on :$CLIPROXY_PORT"
-  if port_listening "$CLIPROXY_PORT"; then
-    log "already listening on $CLIPROXY_PORT"
-    return 0
-  fi
-  [[ -x "$CLIPROXY_BIN" ]] || die "CLIProxyAPI binary missing — run: adapters.sh install cliproxy"
+  ensure_cliproxy_bin || die "CLIProxyAPI binary missing — run: adapters.sh install cliproxy"
   write_cliproxy_tree
-  "$CLIPROXY_DIR/scripts/start.sh"
+  # Ensure the watchdog runs; it supervises the server and keeps the Claude
+  # OAuth token synced bidirectionally while the proxy is up.
+  if cliproxy_watchdog_alive; then
+    log "watchdog already running"
+  else
+    rm -f "$CLIPROXY_DIR/scripts/watchdog.pid"
+    nohup "$CLIPROXY_DIR/scripts/watchdog.sh" >>/tmp/cliproxy.log 2>&1 &
+    log "watchdog started (pid $!)"
+  fi
+  if wait_http "http://127.0.0.1:${CLIPROXY_PORT}/v1/models" "$CLIPROXY_KEY" 30; then
+    log "CLIProxyAPI ready http://127.0.0.1:${CLIPROXY_PORT}/v1"
+  else
+    warn "CLIProxyAPI did not become ready — see /tmp/cliproxy.log"
+    tail -20 /tmp/cliproxy.log 2>/dev/null || true
+    return 1
+  fi
 }
 
 start_litellm() {
@@ -913,7 +1313,30 @@ cmd_start() {
 
 stop_port_procs() {
   local port="$1" label="$2"
-  local pids
+  local pids pid cmd pidfile wpid spid
+  case "$label" in
+    cliproxy)
+      # Kill the watchdog first so it does not respawn the server.
+      pidfile="$CLIPROXY_DIR/scripts/watchdog.pid"
+      if [[ -f "$pidfile" ]]; then
+        wpid="$(cat "$pidfile" 2>/dev/null || true)"
+        if [[ -n "$wpid" && "$wpid" =~ ^[0-9]+$ ]]; then
+          kill "$wpid" 2>/dev/null || true
+        fi
+        rm -f "$pidfile"
+      fi
+      mapfile -t pids < <(pids_matching "$CLIPROXY_DIR/scripts/watchdog.sh")
+      kill_pids "${pids[@]:-}"
+      pidfile="$CLIPROXY_DIR/scripts/server.pid"
+      if [[ -f "$pidfile" ]]; then
+        spid="$(cat "$pidfile" 2>/dev/null || true)"
+        if [[ -n "$spid" && "$spid" =~ ^[0-9]+$ ]]; then
+          kill "$spid" 2>/dev/null || true
+        fi
+        rm -f "$pidfile"
+      fi
+      ;;
+  esac
   # Prefer fuser when available
   if command -v fuser >/dev/null 2>&1; then
     fuser -k "${port}/tcp" 2>/dev/null || true
@@ -921,14 +1344,12 @@ stop_port_procs() {
   # Also kill known process patterns
   case "$label" in
     cliproxy)
-      mapfile -t pids < <(pids_matching "CLIProxyAPI\|/go/bin/server -config\|cliproxy-api/config")
-      # server -config is the real binary name path
       mapfile -t pids < <(pids_matching "$CLIPROXY_DIR/config.yaml")
       kill_pids "${pids[@]:-}"
       mapfile -t pids < <(pids_matching "go/bin/server")
       # only kill if cmdline has cliproxy config
-      local pid cmd
       for pid in "${pids[@]:-}"; do
+        [[ -r "/proc/$pid/cmdline" ]] || continue
         cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
         if [[ "$cmd" == *cliproxy* || "$cmd" == *CLIProxy* || "$cmd" == *"$CLIPROXY_DIR"* ]]; then
           kill "$pid" 2>/dev/null || true
@@ -1225,7 +1646,18 @@ for p in Path("/proc").iterdir():
 PY
 }
 
+ensure_host_inference() {
+  local script="$ROOT/scripts/ensure-xai-inference.sh"
+  if [[ ! -f "$script" ]]; then
+    warn "missing $script — cannot patch sand-host for custom providers"
+    return 1
+  fi
+  chmod +x "$script" 2>/dev/null || true
+  SAND_HOST_DIR="$SAND_HOST" bash "$script"
+}
+
 cmd_restart_host() {
+  ensure_host_inference || warn "host inference patch failed — sand will keep using Cursor"
   log "restart sand host with full env (donor process)"
   local donor
   # Prefer a non-host donor so we can snapshot env, then kill host safely
@@ -1707,6 +2139,10 @@ cmd_use() {
   shift || true
   [[ -n "$profile" ]] || die "usage: adapters.sh use <profile> [flags]"
   parse_use_flags "$@"
+  # Stock host ignores xai-inference.env unless the session hook is present.
+  if [[ "$profile" != "cursor" && "$profile" != "stock" ]]; then
+    ensure_host_inference || warn "host inference patch failed — provider env will not be used"
+  fi
 
   case "$profile" in
     deepseek)
@@ -2146,7 +2582,9 @@ SCRIPTABLE
   adapters start   [all|cliproxy|litellm|openai-oauth]
   adapters stop    [all|cliproxy|litellm|openai-oauth]
   adapters use deepseek|claude|grok-session|openai|openrouter|…
+  adapters sync-claude [--refresh]   # bidirectional Claude OAuth token sync
   adapters restart-host
+  adapters patch-host                 # re-inject host hook after a host upgrade
 
   adapters use grok-session --model grok-4.6 --effort high
   adapters use grok-session --model grok-4.6 --effort medium   # safer multi-agent
@@ -2186,12 +2624,17 @@ main() {
     help|-h|--help) cmd_help ;;
     status|st) cmd_status ;;
     check-logins|check|logins) cmd_check_login_agents ;;
+    sync-claude|sync-auth|refresh-auth)
+      write_cliproxy_tree
+      "$CLIPROXY_DIR/scripts/sync-claude-auth.sh" "${1:-}"
+      ;;
     effort|set-effort|reasoning-effort) cmd_set_effort "$@" ;;
     install) cmd_install "${1:-all}" ;;
     start) cmd_start "${1:-all}" ;;
     stop) cmd_stop "${1:-all}" ;;
     use|switch) cmd_use "$@" ;;
     restart-host|restart) cmd_restart_host ;;
+    patch-host|ensure-host|inject-hook) ensure_host_inference ;;
     *)
       if [[ "$cmd" == -* ]]; then
         die "unknown option: $cmd (try: adapters.sh help)"

@@ -59,6 +59,8 @@ adapters help
 |------|------|
 | `adapters.sh` | Main CLI (install / start / use / menu) |
 | `adapters` | Thin launcher |
+| `xai-prompt-session.cjs` | Host inference module (copied into `~/sand-host`) |
+| `scripts/ensure-xai-inference.sh` | Injects the createSession hook into `host-main.cjs` |
 | `package.json` | npm package + `bin` entries |
 | `docs/` | Long-form guide + assets |
 
