@@ -1,0 +1,28 @@
+# Merged into ~/.local/share/grok-bot-adapters/cliproxy-api/config.yaml by
+# `adapters recover`. Do not put real keys in this file.
+#
+# After a reset, export keys then recover:
+#   export MODEL_API_KEY='…'      # Meta Model API
+#   export DEEPSEEK_API_KEY='…'
+#   adapters recover
+openai-compatibility:
+  - name: Meta Model API
+    base-url: https://api.meta.ai/v1
+    api-key-entries:
+      - api-key: CHANGE_ME_META
+    models:
+      - name: muse-spark-1.1
+        alias: muse-spark-1.1
+      - name: muse-spark-1.2
+        alias: muse-spark-1.2
+      - name: muse-spark-1.2-contributor
+        alias: muse-spark-1.2-contributor
+  - name: Deepseek
+    base-url: https://api.deepseek.com
+    api-key-entries:
+      - api-key: CHANGE_ME_DEEPSEEK
+    models:
+      - name: deepseek-v4-flash
+        alias: deepseek-v4-flash
+      - name: deepseek-v4-pro
+        alias: deepseek-v4-pro

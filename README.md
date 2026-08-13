@@ -17,6 +17,14 @@ npm install -g grok-bot-setup
 adapters
 ```
 
+**After this VM / Sand box resets** (one line):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BlockedPath/grok-bot-setup/main/scripts/bootstrap.sh | bash
+```
+
+That clones/updates the repo, patches `~/sand-host`, installs CLIProxy v7 + Management Center, seeds `xai-inference.env`, and restarts the host. Then `claude login` and, if you use them, `export MODEL_API_KEY=… DEEPSEEK_API_KEY=…` and run `adapters recover` again so keys land in CLIProxy.
+
 ![Grok Bot Inference Adapters interactive menu](docs/assets/adapters-menu.png)
 
 ## Install
@@ -40,9 +48,8 @@ Also available as the `grok-bot-setup` command (same CLI).
 <summary>curl (single script)</summary>
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BlockedPath/grok-bot-setup/main/adapters.sh \
-  -o ~/.local/bin/adapters
-chmod +x ~/.local/bin/adapters
+# full setup (hook + CLIProxy + PATH launcher) — use this after a wipe
+curl -fsSL https://raw.githubusercontent.com/BlockedPath/grok-bot-setup/main/scripts/bootstrap.sh | bash
 ```
 
 </details>
@@ -179,24 +186,36 @@ adapters restart-host
 
 ### After a Sand reset
 
-A box wipe deletes `~/sand-host` patches, `~/sand-data/xai-inference.env`, and local CLIProxy. This git repo is the source of truth. From a clone:
+A box wipe deletes `~/sand-host` patches, `~/sand-data/xai-inference.env`, and local CLIProxy. GitHub is the source of truth.
 
 ```bash
-git clone https://github.com/BlockedPath/grok-bot-setup.git
-cd grok-bot-setup
-chmod +x adapters adapters.sh scripts/*.sh
-./adapters recover
+curl -fsSL https://raw.githubusercontent.com/BlockedPath/grok-bot-setup/main/scripts/bootstrap.sh | bash
+# same as: git clone … && ./adapters recover
 ```
 
-That copies `xai-prompt-session.cjs`, injects the host hook, installs CLIProxy v7 + Management Center, and restarts the host if `~/sand-data/xai-inference.env` exists. Then log back in (`claude login`, `grok login`, …) and:
+`adapters recover` / `scripts/bootstrap.sh`:
+
+1. Clone or fast-forward `~/grok-bot-setup` to `origin/main`
+2. Put `adapters` on `PATH`
+3. Copy `xai-prompt-session.cjs` and inject the host hook
+4. Seed `~/sand-data/xai-inference.env` from the example if missing
+5. Install CLIProxy **v7+** + Management Center
+6. Ensure Meta + DeepSeek model aliases exist (keys from `MODEL_API_KEY` / `DEEPSEEK_API_KEY` if you exported them)
+7. Restart the host
+
+Then:
 
 ```bash
-adapters use claude --model claude-opus-5 --oauth
-# or copy the example env first:
-# cp xai-inference.env.example ~/sand-data/xai-inference.env
+claude login
+grok login            # optional
+export MODEL_API_KEY='…'          # Meta
+export DEEPSEEK_API_KEY='…'       # DeepSeek
+adapters recover                   # writes keys into CLIProxy
+adapters models
+adapters model claude-opus-5       # or muse-spark-1.2-contributor / deepseek-v4-flash / …
 ```
 
-Logins, Meta API keys, and the Management Center key are **not** in git.
+OAuth logins and paid API keys are **not** in git. Model lists are (`examples/cliproxy-openai-compat.yaml`).
 
 ### Multi-agent safety (host module)
 

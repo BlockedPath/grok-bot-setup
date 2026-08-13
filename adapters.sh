@@ -316,6 +316,7 @@ EOF
     log "added streaming.bootstrap-retries to $CLIPROXY_DIR/config.yaml"
   fi
   patch_cliproxy_management_config
+  ensure_cliproxy_compat_providers
   # Bidirectional, freshest-wins sync between Claude Code OAuth credentials and
   # CLIProxyAPI's auth file. Either side may rotate tokens (Claude Code CLI on
   # use, CLIProxyAPI via its built-in auto-refresh), and every rotation revokes
@@ -793,6 +794,116 @@ if new != text:
     print("patched", path)
 else:
     print("management config already set")
+PY
+}
+
+# Ensure Meta + DeepSeek openai-compat entries exist (model aliases filled).
+# Keys come from MODEL_API_KEY / META_API_KEY / DEEPSEEK_API_KEY when the
+# current value is empty or a CHANGE_ME placeholder.
+ensure_cliproxy_compat_providers() {
+  local cfg="$CLIPROXY_DIR/config.yaml"
+  local tmpl="$ROOT/examples/cliproxy-openai-compat.yaml"
+  [[ -f "$cfg" ]] || return 0
+  [[ -f "$tmpl" ]] || return 0
+  python3 - "$cfg" "$tmpl" <<'PY'
+import os, re, sys
+from pathlib import Path
+
+cfg_path, tmpl_path = Path(sys.argv[1]), Path(sys.argv[2])
+text = cfg_path.read_text()
+tmpl = tmpl_path.read_text()
+changed = False
+
+def extract_provider(src, name):
+    # From "  - name: NAME" through the next "  - name:" or EOF inside openai-compatibility
+    pat = re.compile(
+        r"(^[ \t]*- name: %s\n(?:^[ \t]+.*\n)*)" % re.escape(name),
+        re.M,
+    )
+    m = pat.search(src)
+    return m.group(1) if m else ""
+
+def upsert_alias_block(block, model_id):
+    if re.search(r"name: %s\b" % re.escape(model_id), block):
+        # force non-empty alias
+        block2, n = re.subn(
+            r"(- name: %s\n[ \t]*alias: )(\"\"|''|\s*)$" % re.escape(model_id),
+            r'\1%s' % model_id,
+            block,
+            flags=re.M,
+        )
+        return block2, n > 0
+    add = (
+        f"      - name: {model_id}\n"
+        f"        alias: {model_id}\n"
+    )
+    if re.search(r"^    models:\s*$", block, re.M):
+        return re.sub(r"^(    models:\s*\n)", r"\1" + add, block, count=1, flags=re.M), True
+    if not block.endswith("\n"):
+        block += "\n"
+    return block + add, True
+
+def apply_key(block, env_names, placeholder_substr):
+    key = ""
+    for n in env_names:
+        v = os.environ.get(n) or ""
+        if v and not v.upper().startswith("CHANGE_ME"):
+            key = v
+            break
+    if not key:
+        return block, False
+    m = re.search(r"^([ \t]*- api-key: )(.+)$", block, re.M)
+    if not m:
+        return block, False
+    current = m.group(2).strip().strip('"').strip("'")
+    if current and "CHANGE_ME" not in current.upper() and placeholder_substr not in current:
+        return block, False
+    return re.sub(r"^([ \t]*- api-key: ).+$", r"\1" + key, block, count=1, flags=re.M), True
+
+# Pull provider templates from the example file.
+meta_t = extract_provider(tmpl, "Meta Model API")
+ds_t = extract_provider(tmpl, "Deepseek")
+
+if "openai-compatibility:" not in text:
+    extra = "\nopenai-compatibility:\n"
+    if meta_t:
+        extra += meta_t
+    if ds_t:
+        extra += ds_t
+    text = text.rstrip() + extra
+    changed = True
+
+for name, tmpl_block, env_names, placeholder, models in (
+    ("Meta Model API", meta_t, ("MODEL_API_KEY", "META_API_KEY"), "CHANGE_ME_META",
+     ("muse-spark-1.1", "muse-spark-1.2", "muse-spark-1.2-contributor")),
+    ("Deepseek", ds_t, ("DEEPSEEK_API_KEY",), "CHANGE_ME_DEEPSEEK",
+     ("deepseek-v4-flash", "deepseek-v4-pro")),
+):
+    block = extract_provider(text, name)
+    if not block:
+        if tmpl_block:
+            if not text.endswith("\n"):
+                text += "\n"
+            text += tmpl_block
+            block = tmpl_block
+            changed = True
+        else:
+            continue
+    new_block = block
+    for mid in models:
+        new_block, did = upsert_alias_block(new_block, mid)
+        changed = changed or did
+    new_block, did = apply_key(new_block, env_names, placeholder)
+    changed = changed or did
+    if new_block != block:
+        text = text.replace(block, new_block, 1)
+        changed = True
+
+if changed:
+    cfg_path.write_text(text)
+    print("updated openai-compatibility providers")
+else:
+    print("openai-compatibility providers already set")
 PY
 }
 
@@ -2964,6 +3075,13 @@ EOF
     ensure_host_inference || warn "host inference patch failed"
   fi
 
+  if [[ ! -f "$ENV_FILE" && -f "$ROOT/xai-inference.env.example" ]]; then
+    mkdir -p "$(dirname "$ENV_FILE")"
+    cp "$ROOT/xai-inference.env.example" "$ENV_FILE"
+    chmod 600 "$ENV_FILE" 2>/dev/null || true
+    log "seeded $ENV_FILE (Claude via CLIProxy — change with: adapters model …)"
+  fi
+
   install_cliproxy
   start_cliproxy || warn "cliproxy start failed — adapters start cliproxy"
 
@@ -2973,6 +3091,13 @@ EOF
     warn "no $ENV_FILE — point Sand at a provider, e.g.:"
     warn "  adapters use claude --model claude-opus-5 --oauth"
   fi
+  echo
+  echo "Next (logins / paid keys are not in git):"
+  echo "  claude login          # Claude Pro/Max OAuth"
+  echo "  grok login            # Grok session"
+  echo "  export MODEL_API_KEY=… DEEPSEEK_API_KEY=… && adapters recover"
+  echo "  adapters models"
+  echo "  adapters model muse-spark-1.2-contributor"
   echo
   cmd_status || true
 }
