@@ -102,6 +102,8 @@ Or just run **`adapters`** with no args for the interactive menu.
 | `adapters start [target]` | Start local proxies |
 | `adapters stop [target]` | Stop local proxies |
 | `adapters use <profile>` | Switch Grok Bot provider (also installs the host hook) |
+| `adapters models` | List models from CLIProxy (`:8317`) or the current gateway |
+| `adapters model <id>` | Switch Sand to that model (keeps the current CLIProxy/base) |
 | `adapters patch-host` | Copy `xai-prompt-session.cjs` into `~/sand-host` and inject the createSession hook |
 | `adapters recover` | After a Sand reset: reinstall hook + CLIProxy v7 + restart host |
 | `adapters management` | Print CLIProxy Management Center URL + key |

@@ -1763,6 +1763,195 @@ PY
   fi
 }
 
+# ── CLIProxy / current-gateway model list + switch ──────────────────────────
+current_env_val() {
+  local key="$1"
+  [[ -f "$ENV_FILE" ]] || return 0
+  grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true
+}
+
+inference_models_url() {
+  local base
+  base="$(current_env_val SAND_XAI_BASE_URL)"
+  base="${base:-http://127.0.0.1:${CLIPROXY_PORT}/v1}"
+  printf '%s' "${base%/}/models"
+}
+
+inference_models_key() {
+  local key
+  key="$(current_env_val XAI_API_KEY)"
+  printf '%s' "${key:-$CLIPROXY_KEY}"
+}
+
+# Prints "owner<TAB>id" lines. Empty stdout + nonzero if the gateway is down.
+fetch_gateway_models() {
+  local url key
+  url="$(inference_models_url)"
+  key="$(inference_models_key)"
+  MODELS_URL="$url" MODELS_KEY="$key" python3 - <<'PY'
+import json, os, sys, urllib.error, urllib.request
+url = os.environ["MODELS_URL"]
+key = os.environ.get("MODELS_KEY") or ""
+req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
+try:
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        data = json.loads(resp.read().decode() or "{}")
+except Exception as e:
+    print(f"fetch failed: {e}", file=sys.stderr)
+    sys.exit(1)
+rows = []
+for m in data.get("data") or []:
+    if isinstance(m, dict) and m.get("id"):
+        rows.append((str(m.get("owned_by") or "other"), str(m["id"])))
+rows.sort(key=lambda r: (r[0].lower(), r[1].lower()))
+for owner, mid in rows:
+    print(f"{owner}\t{mid}")
+PY
+}
+
+cmd_list_models() {
+  local current rows
+  current="$(current_env_val SAND_XAI_MODEL)"
+  echo "=== models at $(inference_models_url) ==="
+  if [[ -n "$current" ]]; then
+    echo "current: $current"
+    echo
+  fi
+  rows="$(fetch_gateway_models)" || die "could not list models — is CLIProxy up?  adapters start cliproxy"
+  [[ -n "$rows" ]] || die "gateway returned no models"
+  CURRENT_MODEL="$current" MODELS_ROWS="$rows" python3 - <<'PY'
+import os
+current = os.environ.get("CURRENT_MODEL") or ""
+cur = None
+n = 0
+for line in (os.environ.get("MODELS_ROWS") or "").splitlines():
+    if not line or "\t" not in line:
+        continue
+    owner, mid = line.split("\t", 1)
+    if owner != cur:
+        print(f"\n{owner}")
+        cur = owner
+    n += 1
+    mark = "  ← current" if mid == current else ""
+    print(f"  {n:3d}) {mid}{mark}")
+print(f"\n{n} models")
+PY
+}
+
+prompt_gateway_model() {
+  init_tty
+  local current rows choice
+  current="$(current_env_val SAND_XAI_MODEL)"
+  rows="$(fetch_gateway_models)" || die "could not list models — is CLIProxy up?  adapters start cliproxy"
+  [[ -n "$rows" ]] || die "gateway returned no models"
+  local tmp
+  tmp="$(mktemp)"
+  printf '%s\n' "$rows" >"$tmp"
+  {
+    echo
+    echo "CLIProxy / gateway models  ($(inference_models_url))"
+    if [[ -n "$current" ]]; then
+      echo "current: $current"
+    fi
+  } >"$_TTY_OUT"
+  python3 - "$tmp" "$current" >"$_TTY_OUT" <<'PY'
+import sys
+path, current = sys.argv[1], sys.argv[2]
+cur = None
+n = 0
+for line in open(path):
+    line = line.rstrip("\n")
+    if not line or "\t" not in line:
+        continue
+    owner, mid = line.split("\t", 1)
+    if owner != cur:
+        print(f"\n{owner}")
+        cur = owner
+    n += 1
+    mark = "  ← current" if mid == current else ""
+    print(f"  {n:3d}) {mid}{mark}")
+print()
+print("Type a number or a model id.")
+PY
+  choice="$(prompt_line "Model" "${current:-}")"
+  if [[ -z "$choice" ]]; then
+    rm -f "$tmp"
+    die "model is required"
+  fi
+  if [[ "$choice" =~ ^[0-9]+$ ]]; then
+    local picked
+    picked="$(
+      python3 - "$tmp" "$choice" <<'PY'
+import sys
+path, n = sys.argv[1], int(sys.argv[2])
+i = 0
+for line in open(path):
+    line = line.rstrip("\n")
+    if not line or "\t" not in line:
+        continue
+    i += 1
+    if i == n:
+        print(line.split("\t", 1)[1])
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+    )" || { rm -f "$tmp"; die "invalid model number: $choice"; }
+    rm -f "$tmp"
+    printf '%s' "$picked"
+    return 0
+  fi
+  rm -f "$tmp"
+  printf '%s' "$choice"
+}
+
+# Switch only the model id; keep current CLIProxy/base/key.
+cmd_set_model() {
+  local model="${1:-}"
+  shift || true
+  OPT_NO_RESTART="${OPT_NO_RESTART:-0}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --model) model="${2:-}"; shift 2 ;;
+      --no-restart) OPT_NO_RESTART=1; shift ;;
+      --restart) OPT_NO_RESTART=0; shift ;;
+      *) die "unknown flag: $1 (usage: adapters model <id> [--no-restart])" ;;
+    esac
+  done
+
+  if [[ -z "$model" ]]; then
+    if [[ "$INTERACTIVE_MENU" -eq 1 ]] || [[ -t 0 || -c /dev/tty ]]; then
+      model="$(prompt_gateway_model)"
+    else
+      cmd_list_models
+      die "usage: adapters model <id>   (or run adapters with no args and choose Change model)"
+    fi
+  fi
+  [[ -n "$model" ]] || die "model is required"
+
+  # Make sure we can reach the gateway that serves this catalog.
+  local base
+  base="$(current_env_val SAND_XAI_BASE_URL)"
+  if [[ -z "$base" || "$base" == *":${CLIPROXY_PORT}/"* ]]; then
+    start_cliproxy || warn "CLIProxy not running — model switch will still be written"
+  fi
+
+  if [[ ! -f "$ENV_FILE" ]] || [[ "$(current_env_val SAND_INFERENCE_PROVIDER)" == "cursor" ]] || [[ -z "$(current_env_val SAND_XAI_BASE_URL)" ]]; then
+    WRITE_COMMENT="CLIProxy model ${model}" \
+    WRITE_PROVIDER=xai WRITE_BASE_URL="http://127.0.0.1:${CLIPROXY_PORT}/v1" \
+    WRITE_MODEL="$model" WRITE_API_KEY="$CLIPROXY_KEY" \
+    WRITE_THINKING="$(current_env_val SAND_XAI_THINKING)" \
+    WRITE_REASONING_EFFORT="$(current_env_val SAND_XAI_REASONING_EFFORT)" \
+      write_env_file
+  else
+    upsert_env_keys "SAND_INFERENCE_PROVIDER=xai" "SAND_XAI_MODEL=$model"
+    log "SAND_XAI_MODEL=$model"
+  fi
+  patch_settings_model "$model" "$(current_env_val SAND_XAI_REASONING_EFFORT)"
+  ensure_host_inference || warn "host inference patch failed — provider env may be ignored"
+  log "current: $(current_provider_summary)"
+  after_use
+}
+
 # ── host restart ────────────────────────────────────────────────────────────
 find_donor_pid() {
   python3 <<'PY'
@@ -2621,13 +2810,14 @@ cmd_menu() {
       echo
       echo "  1) Status"
       echo "  2) Switch provider     ← DeepSeek, Claude, Grok, …"
-      echo "  3) Reasoning effort    ← high / medium / low / xhigh / off"
-      echo "  4) Install adapters    (CLIProxy / LiteLLM / openai-oauth)"
-      echo "  5) Start adapters"
-      echo "  6) Stop adapters"
-      echo "  7) Restart Grok Bot host"
-      echo "  8) Check / install login agents  (claude, grok, codex, …)"
-      echo "  9) Help"
+      echo "  3) Change model        ← list from CLIProxy / current gateway"
+      echo "  4) Reasoning effort    ← high / medium / low / xhigh / off"
+      echo "  5) Install adapters    (CLIProxy / LiteLLM / openai-oauth)"
+      echo "  6) Start adapters"
+      echo "  7) Stop adapters"
+      echo "  8) Restart Grok Bot host"
+      echo "  9) Check / install login agents  (claude, grok, codex, …)"
+      echo "  h) Help"
       echo "  0) Quit"
     } >"$t"
     choice="$(prompt_line "Choose" "1")"
@@ -2645,40 +2835,44 @@ cmd_menu() {
       2|switch|use)
         menu_switch_provider
         ;;
-      3|effort|reasoning)
+      3|model|models|change-model)
+        cmd_set_model || true
+        pause
+        ;;
+      4|effort|reasoning)
         cmd_set_effort || true
         pause
         ;;
-      4|install)
+      5|install)
         target="$(menu_pick_adapter_target)"
         if [[ -n "$target" ]]; then
           cmd_install "$target" || true
           pause
         fi
         ;;
-      5|start)
+      6|start)
         target="$(menu_pick_adapter_target)"
         if [[ -n "$target" ]]; then
           cmd_start "$target" || true
           pause
         fi
         ;;
-      6|stop)
+      7|stop)
         target="$(menu_pick_adapter_target)"
         if [[ -n "$target" ]]; then
           cmd_stop "$target" || true
           pause
         fi
         ;;
-      7|restart)
+      8|restart)
         cmd_restart_host || true
         pause
         ;;
-      8|logins|login-agents|check)
+      9|logins|login-agents|check)
         ensure_login_agents_interactive || true
         pause
         ;;
-      9|help|h)
+      h|help)
         cmd_help
         pause
         ;;
@@ -2701,13 +2895,14 @@ INTERACTIVE (default)
 MENU PATH
   1 Status
   2 Switch provider → DeepSeek / Claude / Grok / OpenAI / …
-  3 Reasoning effort → high / medium / low / xhigh / off
-  4 Install adapters (CLIProxy / LiteLLM / openai-oauth)
-  5 Start adapters
-  6 Stop adapters
-  7 Restart host
-  8 Check / install login agents (claude, grok, codex)
-  9 Help
+  3 Change model → list from CLIProxy / current gateway
+  4 Reasoning effort → high / medium / low / xhigh / off
+  5 Install adapters (CLIProxy / LiteLLM / openai-oauth)
+  6 Start adapters
+  7 Stop adapters
+  8 Restart host
+  9 Check / install login agents (claude, grok, codex)
+  h Help
   0 Quit
 
 On launch, the menu scans for login agents. If any are missing, it asks
@@ -2722,6 +2917,8 @@ SCRIPTABLE
   adapters start   [all|cliproxy|litellm|openai-oauth]
   adapters stop    [all|cliproxy|litellm|openai-oauth]
   adapters use deepseek|claude|grok-session|openai|openrouter|…
+  adapters models                    # list models from CLIProxy / current gateway
+  adapters model <id> [--no-restart] # switch Sand to that model (keeps CLIProxy)
   adapters sync-claude [--refresh]   # bidirectional Claude OAuth token sync
   adapters restart-host
   adapters patch-host                 # re-inject host hook after a host upgrade
@@ -2731,6 +2928,9 @@ SCRIPTABLE
   adapters use grok-session --model grok-4.6 --effort high
   adapters use grok-session --model grok-4.6 --effort medium   # safer multi-agent
   adapters effort medium                                        # change effort only
+  adapters models
+  adapters model gemini-3.6-flash-high
+  adapters model claude-opus-5
   adapters use deepseek --model deepseek-v4-flash --key sk-... --no-restart
 
 USE FLAGS
@@ -2806,6 +3006,8 @@ main() {
     start) cmd_start "${1:-all}" ;;
     stop) cmd_stop "${1:-all}" ;;
     use|switch) cmd_use "$@" ;;
+    models|list-models|ls-models) cmd_list_models ;;
+    model|set-model|use-model) cmd_set_model "$@" ;;
     restart-host|restart) cmd_restart_host ;;
     patch-host|ensure-host|inject-hook) ensure_host_inference ;;
     recover|restore|bootstrap) cmd_recover ;;
