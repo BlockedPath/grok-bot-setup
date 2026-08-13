@@ -2149,28 +2149,24 @@ prompt_deepseek_model() {
     echo
     echo "DeepSeek model:"
     echo "  1) deepseek-v4-flash     (fast, default)"
-    echo "  2) deepseek-chat"
-    echo "  3) deepseek-reasoner"
-    echo "  4) deepseek-coder"
-    echo "  5) Other (type a model id)"
+    echo "  2) deepseek-v4-pro"
+    echo "  3) Other (type a model id)"
     if [[ -n "$current" ]]; then
-      echo "  6) Keep current ($current)"
+      echo "  4) Keep current ($current)"
     fi
   } >"$_TTY_OUT"
   local choice
-  choice="$(prompt_line "Choose 1-5${current:+/6}" "1")"
+  choice="$(prompt_line "Choose 1-3${current:+/4}" "1")"
   case "$choice" in
     1|"") printf '%s' "deepseek-v4-flash" ;;
-    2) printf '%s' "deepseek-chat" ;;
-    3) printf '%s' "deepseek-reasoner" ;;
-    4) printf '%s' "deepseek-coder" ;;
-    5)
+    2) printf '%s' "deepseek-v4-pro" ;;
+    3)
       local custom
       custom="$(prompt_line "Model id" "${current:-deepseek-v4-flash}")"
       [[ -n "$custom" ]] || die "model id cannot be empty"
       printf '%s' "$custom"
       ;;
-    6)
+    4)
       if [[ -n "$current" ]]; then
         printf '%s' "$current"
       else
