@@ -2725,6 +2725,7 @@ SCRIPTABLE
   adapters sync-claude [--refresh]   # bidirectional Claude OAuth token sync
   adapters restart-host
   adapters patch-host                 # re-inject host hook after a host upgrade
+  adapters recover                    # after a sand reset: hook + CLIProxy + restart
   adapters management                 # print Management Center URL + key
 
   adapters use grok-session --model grok-4.6 --effort high
@@ -2747,6 +2748,37 @@ Host multi-agent safety (xai-prompt-session.cjs):
 
 Docs: ${ROOT}/docs/GUIDE_CUSTOM_INFERENCE.md
 EOF
+}
+
+# Rebuild host hook + CLIProxy after a sand-host / sand-data wipe.
+cmd_recover() {
+  log "recover custom inference after a sand reset"
+  chmod +x "$ROOT/adapters" "$ROOT/adapters.sh" "$ROOT/scripts/ensure-xai-inference.sh" 2>/dev/null || true
+  mkdir -p "$HOME/.local/bin"
+  cat >"$HOME/.local/bin/adapters" <<EOF
+#!/bin/sh
+exec "$ROOT/adapters.sh" "\$@"
+EOF
+  chmod +x "$HOME/.local/bin/adapters"
+  log "PATH launcher $HOME/.local/bin/adapters → $ROOT/adapters.sh"
+
+  if [[ ! -d "$SAND_HOST" || ! -f "$SAND_HOST/host-main.cjs" ]]; then
+    warn "missing $SAND_HOST/host-main.cjs — wait for Sand to unpack the host, then re-run: adapters recover"
+  else
+    ensure_host_inference || warn "host inference patch failed"
+  fi
+
+  install_cliproxy
+  start_cliproxy || warn "cliproxy start failed — adapters start cliproxy"
+
+  if [[ -f "$ENV_FILE" ]]; then
+    cmd_restart_host || warn "host restart failed"
+  else
+    warn "no $ENV_FILE — point Sand at a provider, e.g.:"
+    warn "  adapters use claude --model claude-opus-5 --oauth"
+  fi
+  echo
+  cmd_status || true
 }
 
 # ── main ────────────────────────────────────────────────────────────────────
@@ -2776,6 +2808,7 @@ main() {
     use|switch) cmd_use "$@" ;;
     restart-host|restart) cmd_restart_host ;;
     patch-host|ensure-host|inject-hook) ensure_host_inference ;;
+    recover|restore|bootstrap) cmd_recover ;;
     management|mgmt|cliproxy-ui)
       ensure_cliproxy_mgmt_key >/dev/null
       echo "Management Center  http://127.0.0.1:${CLIPROXY_PORT}/management.html"

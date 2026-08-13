@@ -61,6 +61,8 @@ adapters help
 | `adapters` | Thin launcher |
 | `xai-prompt-session.cjs` | Host inference module (copied into `~/sand-host`) |
 | `scripts/ensure-xai-inference.sh` | Injects the createSession hook into `host-main.cjs` |
+| `scripts/restore-after-reset.sh` | `adapters recover` after a Sand wipe |
+| `xai-inference.env.example` | Template for `~/sand-data/xai-inference.env` |
 | `package.json` | npm package + `bin` entries |
 | `docs/` | Long-form guide + assets |
 

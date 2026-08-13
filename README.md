@@ -103,6 +103,7 @@ Or just run **`adapters`** with no args for the interactive menu.
 | `adapters stop [target]` | Stop local proxies |
 | `adapters use <profile>` | Switch Grok Bot provider (also installs the host hook) |
 | `adapters patch-host` | Copy `xai-prompt-session.cjs` into `~/sand-host` and inject the createSession hook |
+| `adapters recover` | After a Sand reset: reinstall hook + CLIProxy v7 + restart host |
 | `adapters management` | Print CLIProxy Management Center URL + key |
 | `adapters restart-host` | Restart Sand host to pick up config |
 | `adapters help` | Full help |
@@ -174,6 +175,27 @@ adapters patch-host
 adapters restart-host
 ```
 
+### After a Sand reset
+
+A box wipe deletes `~/sand-host` patches, `~/sand-data/xai-inference.env`, and local CLIProxy. This git repo is the source of truth. From a clone:
+
+```bash
+git clone https://github.com/BlockedPath/grok-bot-setup.git
+cd grok-bot-setup
+chmod +x adapters adapters.sh scripts/*.sh
+./adapters recover
+```
+
+That copies `xai-prompt-session.cjs`, injects the host hook, installs CLIProxy v7 + Management Center, and restarts the host if `~/sand-data/xai-inference.env` exists. Then log back in (`claude login`, `grok login`, …) and:
+
+```bash
+adapters use claude --model claude-opus-5 --oauth
+# or copy the example env first:
+# cp xai-inference.env.example ~/sand-data/xai-inference.env
+```
+
+Logins, Meta API keys, and the Management Center key are **not** in git.
+
 ### Multi-agent safety (host module)
 
 Shipped as `xai-prompt-session.cjs` and installed to `~/sand-host/xai-prompt-session.cjs`:
@@ -181,6 +203,8 @@ Shipped as `xai-prompt-session.cjs` and installed to `~/sand-host/xai-prompt-ses
 | Env | Default | Meaning |
 |-----|---------|---------|
 | `SAND_XAI_MAX_TOKENS` | `8192` | Cap completion length (`0` = omit) |
+| `SAND_XAI_MAX_INPUT_CHARS` | `280000` on Gemini / `400000` else | Drop old turns so input stays under the provider cap |
+| `SAND_XAI_MAX_TOOL_CHARS` | `12000` | Truncate a single tool result (file dumps) |
 | `SAND_XAI_PROMOTE_REASONING` | off | Do **not** re-inject reasoning as normal chat content (stops monologue loops) |
 
 For group chats prefer: `adapters effort medium`

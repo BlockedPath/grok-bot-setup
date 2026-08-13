@@ -428,6 +428,177 @@ function convertMessages(rawList) {
   return out;
 }
 
+function intEnv(name, fallback) {
+  const n = Number(env(name, String(fallback)));
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+function messageChars(msg) {
+  if (!msg) return 0;
+  let n = 0;
+  if (typeof msg.content === "string") n += msg.content.length;
+  else if (Array.isArray(msg.content)) {
+    for (const p of msg.content) {
+      if (!p) continue;
+      if (typeof p === "string") n += p.length;
+      else if (typeof p.text === "string") n += p.text.length;
+      else n += JSON.stringify(p).length;
+    }
+  }
+  if (Array.isArray(msg.tool_calls)) n += JSON.stringify(msg.tool_calls).length;
+  return n;
+}
+
+function clipText(s, max) {
+  if (typeof s !== "string" || s.length <= max) return s;
+  const keep = Math.max(64, Math.floor((max - 48) / 2));
+  return `${s.slice(0, keep)}\n…[truncated ${s.length - max} chars]…\n${s.slice(-keep)}`;
+}
+
+function clipMessageContent(msg, max) {
+  if (!msg || typeof msg.content !== "string" || msg.content.length <= max) return msg;
+  return { ...msg, content: clipText(msg.content, max) };
+}
+
+function hasToolCalls(msg) {
+  return Boolean(msg && msg.role === "assistant" && Array.isArray(msg.tool_calls) && msg.tool_calls.length);
+}
+
+function mergeConsecutiveRoles(msgs) {
+  const out = [];
+  for (const raw of msgs) {
+    const m = { ...raw };
+    if (Array.isArray(m.tool_calls)) m.tool_calls = m.tool_calls.map((t) => ({ ...t }));
+    const last = out[out.length - 1];
+    if (m.role === "user" && last && last.role === "user") {
+      const a = typeof last.content === "string" ? last.content : "";
+      const b = typeof m.content === "string" ? m.content : "";
+      last.content = [a, b].filter(Boolean).join("\n\n");
+      continue;
+    }
+    if (m.role === "assistant" && last && last.role === "assistant") {
+      const texts = [];
+      if (typeof last.content === "string" && last.content) texts.push(last.content);
+      if (typeof m.content === "string" && m.content) texts.push(m.content);
+      if (texts.length) last.content = texts.join("\n");
+      if (m.tool_calls && m.tool_calls.length) {
+        last.tool_calls = [...(last.tool_calls || []), ...m.tool_calls];
+      }
+      continue;
+    }
+    out.push(m);
+  }
+  return out;
+}
+
+// Gemini: a function-call turn must follow a user or function-response turn.
+// Never start (after system) with assistant/tool, and never leave orphan tool rows.
+function normalizeToolTurns(msgs) {
+  let list = mergeConsecutiveRoles(msgs);
+  const out = [];
+  for (const m of list) {
+    if (m.role === "system") {
+      out.push(m);
+      continue;
+    }
+    if (m.role === "tool") {
+      const last = out[out.length - 1];
+      if (last && (hasToolCalls(last) || last.role === "tool")) out.push(m);
+      continue;
+    }
+    if (hasToolCalls(m)) {
+      const last = out[out.length - 1];
+      if (!last || (last.role !== "user" && last.role !== "tool")) continue;
+    }
+    out.push(m);
+  }
+  // After system, conversation must start with user.
+  let i = 0;
+  while (i < out.length && out[i].role === "system") i++;
+  while (i < out.length && out[i].role !== "user") {
+    if (out[i].role === "assistant") {
+      let j = i + 1;
+      while (j < out.length && out[j].role === "tool") j++;
+      out.splice(i, j - i);
+      continue;
+    }
+    out.splice(i, 1);
+  }
+  if (i >= out.length) {
+    out.push({ role: "user", content: "(continue)" });
+  }
+  return out;
+}
+
+function dropOldestTurn(msgs) {
+  let i = 0;
+  while (i < msgs.length && msgs[i].role === "system") i++;
+  if (i >= msgs.length - 1) return false;
+  // Drop the oldest user turn AND the agent loop that followed it, so a
+  // function-call never becomes the first turn after system.
+  if (msgs[i].role === "user") {
+    let j = i + 1;
+    while (j < msgs.length - 1 && msgs[j].role !== "user") j++;
+    if (j >= msgs.length) return false;
+    msgs.splice(i, j - i);
+    return true;
+  }
+  if (msgs[i].role === "assistant") {
+    let j = i + 1;
+    while (j < msgs.length - 1 && msgs[j].role === "tool") j++;
+    msgs.splice(i, j - i);
+    return true;
+  }
+  msgs.splice(i, 1);
+  return true;
+}
+
+// Gemini / Antigravity reject requests over ~1,048,576 input tokens. Long Grok Bot
+// threads plus one huge tool result (file dump) blow that. Keep system + recent turns.
+function trimConvertedMessages(messages, model) {
+  const list = Array.isArray(messages) ? messages.map((m) => ({ ...m })) : [];
+  const gemini = /gemini/i.test(String(model || ""));
+  const maxTool = intEnv("SAND_XAI_MAX_TOOL_CHARS", 12000);
+  const maxSys = intEnv("SAND_XAI_MAX_SYSTEM_CHARS", 60000);
+  const maxOther = intEnv("SAND_XAI_MAX_MESSAGE_CHARS", 24000);
+  const defaultTotal = gemini ? 280000 : 400000;
+  const maxTotal = intEnv("SAND_XAI_MAX_INPUT_CHARS", defaultTotal);
+
+  const before = list.reduce((n, m) => n + messageChars(m), 0);
+  const beforeCount = list.length;
+
+  for (let i = 0; i < list.length; i++) {
+    const role = list[i].role;
+    const cap = role === "system" ? maxSys : role === "tool" ? maxTool : maxOther;
+    list[i] = clipMessageContent(list[i], cap);
+  }
+
+  let total = list.reduce((n, m) => n + messageChars(m), 0);
+  let dropped = 0;
+  while (total > maxTotal && list.length > 3 && dropOldestTurn(list)) {
+    dropped += 1;
+    total = list.reduce((n, m) => n + messageChars(m), 0);
+  }
+
+  if (total > maxTotal) {
+    for (let i = 0; i < list.length && total > maxTotal; i++) {
+      if (list[i].role !== "tool") continue;
+      const prev = messageChars(list[i]);
+      list[i] = { ...list[i], content: "[truncated: prior tool output omitted to fit context]" };
+      total += messageChars(list[i]) - prev;
+    }
+  }
+
+  const normalized = normalizeToolTurns(list);
+  const after = normalized.reduce((n, m) => n + messageChars(m), 0);
+  if (after !== before || dropped || normalized.length !== beforeCount) {
+    console.error(
+      `[sand-xai] trimmed input chars ${before}→${after} msgs ${beforeCount}→${normalized.length} droppedTurns=${dropped} model=${model}`
+    );
+  }
+  return normalized;
+}
+
 function convertTools(tools) {
   if (!Array.isArray(tools) || tools.length === 0) return undefined;
   return tools.map((tool) => {
@@ -436,7 +607,7 @@ function convertTools(tools) {
       type: "function",
       function: {
         name: sanitizeToolName(t.name),
-        description: asString(t.description || t.name || ""),
+        description: clipText(asString(t.description || t.name || ""), 800),
         parameters: normalizeToolParameters(t.parameters ?? t.inputSchema ?? t.schema),
       },
     };
@@ -595,7 +766,7 @@ function errorResult(modelId, invocationId, err) {
 }
 
 async function runStream({ model, messages, tools, invocationId, auth }) {
-  const converted = convertMessages(messages);
+  const converted = trimConvertedMessages(convertMessages(messages), model);
   debugDump(messages, converted);
   const openaiTools = convertTools(tools);
 
@@ -822,7 +993,13 @@ function createXaiPromptSession(options) {
   return session;
 }
 
-module.exports = { createXaiPromptSession, convertMessages, normalizeToolParameters, mapModelId };
+module.exports = {
+  createXaiPromptSession,
+  convertMessages,
+  normalizeToolParameters,
+  mapModelId,
+  trimConvertedMessages,
+};
 
 if (require.main === module) {
   loadEnvFile();

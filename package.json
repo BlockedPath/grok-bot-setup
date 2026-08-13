@@ -29,7 +29,9 @@
     "adapters",
     "adapters.sh",
     "xai-prompt-session.cjs",
+    "xai-inference.env.example",
     "scripts/ensure-xai-inference.sh",
+    "scripts/restore-after-reset.sh",
     "docs/GUIDE_CUSTOM_INFERENCE.md",
     "README.md",
     "LICENSE"
@@ -45,6 +47,6 @@
   "scripts": {
     "adapters": "bash ./adapters.sh",
     "prepack": "test -x adapters.sh",
-    "test": "bash -n adapters.sh && bash -n adapters && bash -n scripts/ensure-xai-inference.sh && bash ./adapters.sh help >/dev/null"
+    "test": "bash -n adapters.sh && bash -n adapters && bash -n scripts/ensure-xai-inference.sh && bash -n scripts/restore-after-reset.sh && bash ./adapters.sh help >/dev/null"
   }
 }
