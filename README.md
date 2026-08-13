@@ -103,6 +103,7 @@ Or just run **`adapters`** with no args for the interactive menu.
 | `adapters stop [target]` | Stop local proxies |
 | `adapters use <profile>` | Switch Grok Bot provider (also installs the host hook) |
 | `adapters patch-host` | Copy `xai-prompt-session.cjs` into `~/sand-host` and inject the createSession hook |
+| `adapters management` | Print CLIProxy Management Center URL + key |
 | `adapters restart-host` | Restart Sand host to pick up config |
 | `adapters help` | Full help |
 
@@ -116,6 +117,11 @@ Or just run **`adapters`** with no args for the interactive menu.
 
 The cliproxy start now also launches a watchdog that keeps the proxy up and re-syncs
 Claude OAuth tokens every 60s (either side may rotate them and revoke the other's).
+
+CLIProxy **v7+** serves the [Management Center](https://github.com/router-for-me/Cli-Proxy-API-Management-Center)
+at `http://127.0.0.1:8317/management.html`. The management key is written to
+`~/.local/share/grok-bot-adapters/cliproxy-api/management.key` (not the same as
+the proxy API key `sand-cliproxy`).
 
 ## Provider profiles (`adapters use …`)
 

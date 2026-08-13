@@ -50,6 +50,8 @@ CLIPROXY_PORT="${CLIPROXY_PORT:-8317}"
 LITELLM_PORT="${LITELLM_PORT:-4000}"
 OPENAI_OAUTH_PORT="${OPENAI_OAUTH_PORT:-10531}"
 CLIPROXY_KEY="${CLIPROXY_KEY:-sand-cliproxy}"
+CLIPROXY_MGMT_KEY_FILE="${CLIPROXY_MGMT_KEY_FILE:-$CLIPROXY_DIR/management.key}"
+CLIPROXY_PANEL_REPO="${CLIPROXY_PANEL_REPO:-https://github.com/router-for-me/Cli-Proxy-API-Management-Center}"
 LITELLM_KEY_DEFAULT="sk-local-bridge-change-me"
 
 # 1 when running the full interactive menu loop
@@ -240,6 +242,12 @@ PY
   [[ -f "$HOME/.claude/.credentials.json" ]] && echo "claude oauth: present" || echo "claude oauth: missing (claude login)"
   [[ -f "$HOME/.codex/auth.json" ]] && echo "codex oauth:  present" || echo "codex oauth:  missing (codex login)"
   [[ -f "$HOME/.grok/auth.json" ]] && echo "grok oauth:   present" || echo "grok oauth:   missing (grok login)"
+  if [[ -s "$CLIPROXY_MGMT_KEY_FILE" ]]; then
+    echo "management UI: http://127.0.0.1:${CLIPROXY_PORT}/management.html"
+    echo "management key: $CLIPROXY_MGMT_KEY_FILE"
+  else
+    echo "management UI: not configured (adapters install cliproxy)"
+  fi
   local cp_auth_dir="${CLIPROXY_AUTH_DIR:-$HOME/.cli-proxy-api}"
   if [[ -f "$cp_auth_dir/claude-pro-local.json" ]]; then
     python3 - "$cp_auth_dir/claude-pro-local.json" <<'PY'
@@ -277,6 +285,7 @@ PY
 write_cliproxy_tree() {
   local cp_auth_dir="${CLIPROXY_AUTH_DIR:-$HOME/.cli-proxy-api}"
   mkdir -p "$CLIPROXY_DIR/scripts" "$cp_auth_dir"
+  CLIPROXY_MGMT_KEY="$(ensure_cliproxy_mgmt_key)"
   if [[ ! -f "$CLIPROXY_DIR/config.yaml" ]]; then
     cat >"$CLIPROXY_DIR/config.yaml" <<EOF
 host: "127.0.0.1"
@@ -285,7 +294,7 @@ auth-dir: "${cp_auth_dir}"
 api-keys:
   - "${CLIPROXY_KEY}"
 debug: true
-logging-to-file: false
+logging-to-file: true
 request-retry: 2
 disable-cooling: true
 ws-auth: false
@@ -293,8 +302,9 @@ streaming:
   bootstrap-retries: 3
 remote-management:
   allow-remote: false
-  secret-key: ""
-  disable-control-panel: true
+  secret-key: "${CLIPROXY_MGMT_KEY}"
+  disable-control-panel: false
+  panel-github-repository: "${CLIPROXY_PANEL_REPO}"
 EOF
     log "wrote $CLIPROXY_DIR/config.yaml"
   elif ! grep -q '^streaming:' "$CLIPROXY_DIR/config.yaml" 2>/dev/null; then
@@ -305,6 +315,7 @@ streaming:
 EOF
     log "added streaming.bootstrap-retries to $CLIPROXY_DIR/config.yaml"
   fi
+  patch_cliproxy_management_config
   # Bidirectional, freshest-wins sync between Claude Code OAuth credentials and
   # CLIProxyAPI's auth file. Either side may rotate tokens (Claude Code CLI on
   # use, CLIProxyAPI via its built-in auto-refresh), and every rotation revokes
@@ -699,19 +710,148 @@ EOF
   chmod +x "$CLIPROXY_DIR/scripts/start.sh" "$CLIPROXY_DIR/scripts/sync-claude-auth.sh" "$CLIPROXY_DIR/scripts/watchdog.sh"
 }
 
-install_cliproxy() {
-  log "install CLIProxyAPI"
-  need_cmd go
-  if ensure_cliproxy_bin; then
-    log "binary already present: $CLIPROXY_BIN"
+cliproxy_bin_version() {
+  local out
+  [[ -x "$CLIPROXY_BIN" ]] || return 1
+  out="$("$CLIPROXY_BIN" --help 2>&1 | head -1 || true)"
+  printf '%s' "$out"
+}
+
+cliproxy_bin_is_v7() {
+  local out
+  out="$(cliproxy_bin_version 2>/dev/null || true)"
+  [[ "$out" == *"Version:"* ]] || return 1
+  [[ "$out" == *"Version: dev"* ]] && return 1
+  if [[ "$out" =~ Version:\ *v?([0-9]+) ]]; then
+    [[ "${BASH_REMATCH[1]}" -ge 7 ]]
+    return
+  fi
+  return 1
+}
+
+ensure_cliproxy_mgmt_key() {
+  mkdir -p "$(dirname "$CLIPROXY_MGMT_KEY_FILE")"
+  if [[ -n "${CLIPROXY_MGMT_KEY:-}" ]]; then
+    # Keep a previously persisted key if the caller didn't override.
+    :
+  elif [[ -s "$CLIPROXY_MGMT_KEY_FILE" ]]; then
+    CLIPROXY_MGMT_KEY="$(tr -d '[:space:]' <"$CLIPROXY_MGMT_KEY_FILE")"
   else
-    log "go install github.com/router-for-me/CLIProxyAPI/v6/cmd/server@latest"
-    GOBIN="$(dirname "$CLIPROXY_BIN")" go install github.com/router-for-me/CLIProxyAPI/v6/cmd/server@latest
-    chmod +x "$CLIPROXY_BIN" 2>/dev/null || true
+    CLIPROXY_MGMT_KEY="sand-mgmt-$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+    warn "generated management key → $CLIPROXY_MGMT_KEY_FILE"
+  fi
+  # Refuse to persist a value that accidentally captured log lines.
+  if [[ "$CLIPROXY_MGMT_KEY" == *$'\n'* || "$CLIPROXY_MGMT_KEY" == *'+ '* ]]; then
+    CLIPROXY_MGMT_KEY="sand-mgmt-$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+    warn "regenerated management key (previous value was not a key)"
+  fi
+  printf '%s\n' "$CLIPROXY_MGMT_KEY" >"$CLIPROXY_MGMT_KEY_FILE"
+  chmod 600 "$CLIPROXY_MGMT_KEY_FILE" 2>/dev/null || true
+  printf '%s' "$CLIPROXY_MGMT_KEY"
+}
+
+patch_cliproxy_management_config() {
+  local cfg="$CLIPROXY_DIR/config.yaml" key
+  [[ -f "$cfg" ]] || return 0
+  key="$(ensure_cliproxy_mgmt_key)"
+  CLIPROXY_MGMT_KEY="$key" CLIPROXY_PANEL_REPO="$CLIPROXY_PANEL_REPO" python3 - "$cfg" <<'PY'
+import os, pathlib, re, sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+key = os.environ["CLIPROXY_MGMT_KEY"]
+repo = os.environ.get("CLIPROXY_PANEL_REPO", "https://github.com/router-for-me/Cli-Proxy-API-Management-Center")
+# cliproxy hashes a plaintext secret-key on first start. Keep an existing bcrypt hash.
+existing = ""
+m = re.search(r'^[ \t]*secret-key:[ \t]*["\']?([^"\'\n]+)', text, re.M)
+if m:
+    existing = m.group(1).strip()
+yaml_key = existing if existing.startswith(("$2a$", "$2b$", "$2y$")) else key
+block = (
+    "remote-management:\n"
+    "  allow-remote: false\n"
+    f'  secret-key: "{yaml_key}"\n'
+    "  disable-control-panel: false\n"
+    f'  panel-github-repository: "{repo}"\n'
+)
+# Replace a possibly-broken remote-management mapping (multiline secret-key etc.)
+new, n = re.subn(
+    r"^remote-management:\n(?:[ \t]+.*\n)*",
+    block,
+    text,
+    count=1,
+    flags=re.M,
+)
+if n == 0:
+    new = text.rstrip() + "\n" + block
+    n = 1
+if re.search(r"^logging-to-file:", new, re.M):
+    new2, n2 = re.subn(r"^(logging-to-file:[ \t]*).*$", r"\1true", new, count=1, flags=re.M)
+    if n2:
+        new = new2
+if new != text:
+    path.write_text(new)
+    print("patched", path)
+else:
+    print("management config already set")
+PY
+}
+
+install_cliproxy_release() {
+  # Official v7+ Linux build. go install of v7 needs Go 1.26; this image is older.
+  need_cmd curl
+  need_cmd tar
+  local arch tag url tmp extract bin
+  case "$(uname -m)" in
+    x86_64|amd64) arch="linux_amd64" ;;
+    aarch64|arm64) arch="linux_aarch64" ;;
+    *) die "unsupported arch $(uname -m) for CLIProxyAPI release" ;;
+  esac
+  tag="$(
+    curl -fsSIL https://github.com/router-for-me/CLIProxyAPI/releases/latest \
+      | tr -d '\r' \
+      | awk -F/ 'tolower($1)=="location:" {print $NF; exit}'
+  )"
+  tag="${tag:-v7.2.131}"
+  tag="${tag#v}"
+  url="https://github.com/router-for-me/CLIProxyAPI/releases/download/v${tag}/CLIProxyAPI_${tag}_${arch}.tar.gz"
+  log "download $url"
+  tmp="$(mktemp -d)"
+  curl -fL --retry 3 -o "$tmp/cliproxy.tgz" "$url"
+  mkdir -p "$tmp/extract"
+  tar -xzf "$tmp/cliproxy.tgz" -C "$tmp/extract"
+  bin="$(
+    find "$tmp/extract" -type f \( -name 'CLIProxyAPI' -o -name 'cli-proxy-api' -o -name 'server' \) \
+      | head -1
+  )"
+  [[ -n "$bin" ]] || die "release tarball had no CLIProxyAPI binary"
+  mkdir -p "$(dirname "$CLIPROXY_BIN")"
+  if [[ -f "$CLIPROXY_BIN" ]]; then
+    cp -f "$CLIPROXY_BIN" "${CLIPROXY_BIN}.bak" 2>/dev/null || true
+  fi
+  cp -f "$bin" "$CLIPROXY_BIN"
+  chmod +x "$CLIPROXY_BIN"
+  rm -rf "$tmp"
+  log "installed $CLIPROXY_BIN ($(cliproxy_bin_version || echo v${tag}))"
+}
+
+install_cliproxy() {
+  log "install CLIProxyAPI (v7+ for Management Center)"
+  if cliproxy_bin_is_v7; then
+    log "binary already v7+: $CLIPROXY_BIN ($(cliproxy_bin_version))"
+  else
+    if ! install_cliproxy_release; then
+      warn "release download failed; trying go install v7"
+      need_cmd go
+      log "go install github.com/router-for-me/CLIProxyAPI/v7/cmd/server@latest"
+      GOBIN="$(dirname "$CLIPROXY_BIN")" go install github.com/router-for-me/CLIProxyAPI/v7/cmd/server@latest
+      chmod +x "$CLIPROXY_BIN" 2>/dev/null || true
+    fi
     ensure_cliproxy_bin || die "CLIProxyAPI install did not produce an executable at $CLIPROXY_BIN"
   fi
   write_cliproxy_tree
   log "CLIProxyAPI install OK ($CLIPROXY_DIR)"
+  log "Management Center: http://127.0.0.1:${CLIPROXY_PORT}/management.html"
+  log "management key: $CLIPROXY_MGMT_KEY_FILE"
   if [[ ! -f "$HOME/.claude/.credentials.json" ]]; then
     warn "no Claude OAuth yet — run: claude login  (then: adapters.sh start cliproxy)"
   fi
@@ -2585,6 +2725,7 @@ SCRIPTABLE
   adapters sync-claude [--refresh]   # bidirectional Claude OAuth token sync
   adapters restart-host
   adapters patch-host                 # re-inject host hook after a host upgrade
+  adapters management                 # print Management Center URL + key
 
   adapters use grok-session --model grok-4.6 --effort high
   adapters use grok-session --model grok-4.6 --effort medium   # safer multi-agent
@@ -2635,6 +2776,16 @@ main() {
     use|switch) cmd_use "$@" ;;
     restart-host|restart) cmd_restart_host ;;
     patch-host|ensure-host|inject-hook) ensure_host_inference ;;
+    management|mgmt|cliproxy-ui)
+      ensure_cliproxy_mgmt_key >/dev/null
+      echo "Management Center  http://127.0.0.1:${CLIPROXY_PORT}/management.html"
+      echo "API address        http://127.0.0.1:${CLIPROXY_PORT}"
+      echo "management key     $(tr -d '[:space:]' <"$CLIPROXY_MGMT_KEY_FILE")"
+      echo "key file           $CLIPROXY_MGMT_KEY_FILE"
+      echo
+      echo "This is NOT the proxy API key (${CLIPROXY_KEY})."
+      echo "From this box's browser, localhost is enough (allow-remote is off)."
+      ;;
     *)
       if [[ "$cmd" == -* ]]; then
         die "unknown option: $cmd (try: adapters.sh help)"
