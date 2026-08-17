@@ -1354,6 +1354,24 @@ install_ghostty() {
   fi
 }
 
+install_tailscale() {
+  log "install Tailscale (mesh VPN — tailscale.com)"
+  if has_cmd tailscale; then
+    log "already installed: $(command -v tailscale)"
+    return 0
+  fi
+  need_cmd curl
+  log "curl -fsSL https://tailscale.com/install.sh | sh"
+  curl -fsSL https://tailscale.com/install.sh | sh
+  hash -r 2>/dev/null || true
+  if has_cmd tailscale; then
+    log "tailscale installed: $(command -v tailscale)"
+    log "next: sudo tailscale up   # authenticate this box into your tailnet"
+  else
+    warn "tailscale install finished but binary not found — try: sudo tailscale up"
+  fi
+}
+
 install_codex_cli() {
   log "install Codex CLI"
   if has_cmd codex; then
@@ -1530,13 +1548,14 @@ cmd_install() {
     codex|codex-cli) install_codex_cli ;;
     herdr|herdr-cli) install_herdr ;;
     ghostty|ghostty-term) install_ghostty ;;
+    tailscale) install_tailscale ;;
     login-agents|logins)
       # install any missing login CLIs without prompting
       has_cmd claude || install_claude_cli
       resolve_grok_bin >/dev/null || install_grok_cli
       has_cmd codex || install_codex_cli
       ;;
-    *) die "unknown install target: $target (all|cliproxy|litellm|openai-oauth|claude|grok|codex|herdr|ghostty|login-agents)" ;;
+    *) die "unknown install target: $target (all|cliproxy|litellm|openai-oauth|claude|grok|codex|herdr|ghostty|tailscale|login-agents)" ;;
   esac
   echo
   log "done. Next: adapters.sh start …  or  adapters.sh use <profile>"
@@ -2972,6 +2991,7 @@ menu_pick_install_target() {
     echo "  4) openai-oauth    (:10531 Codex)"
     echo "  5) herdr           (agent runtime — herdr.dev)"
     echo "  6) ghostty         (terminal emulator)"
+    echo "  7) tailscale       (mesh VPN — remote access)"
     echo "  0) Cancel"
   } >"$t"
   choice="$(prompt_line "Choose" "1")"
@@ -2983,6 +3003,7 @@ menu_pick_install_target() {
     4) printf '%s' "openai-oauth" ;;
     5) printf '%s' "herdr" ;;
     6) printf '%s' "ghostty" ;;
+    7) printf '%s' "tailscale" ;;
     *) printf '%s' "all" ;;
   esac
 }
@@ -3100,7 +3121,7 @@ MENU PATH
   2 Switch provider → DeepSeek / Claude / Grok / OpenAI / …
   3 Change model → list from CLIProxy / current gateway
   4 Reasoning effort → high / medium / low / xhigh / off
-  5 Install adapters / tools (CLIProxy / LiteLLM / openai-oauth / herdr / ghostty)
+  5 Install adapters / tools (CLIProxy / LiteLLM / openai-oauth / herdr / ghostty / tailscale)
   6 Start adapters
   7 Stop adapters
   8 Restart host
@@ -3116,7 +3137,7 @@ SCRIPTABLE
   adapters status
   adapters check-logins
   adapters effort high|medium|low|xhigh|off [--no-restart]
-  adapters install [all|cliproxy|litellm|openai-oauth|claude|grok|codex|herdr|ghostty|login-agents]
+  adapters install [all|cliproxy|litellm|openai-oauth|claude|grok|codex|herdr|ghostty|tailscale|login-agents]
   adapters start   [all|cliproxy|litellm|openai-oauth]
   adapters stop    [all|cliproxy|litellm|openai-oauth]
   adapters use deepseek|claude|grok-session|openai|openrouter|…
