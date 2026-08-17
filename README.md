@@ -72,6 +72,10 @@ cd grok-bot-setup
 adapters install all
 adapters install login-agents
 
+# 1b) Optional extra tools
+adapters install herdr    # agent runtime — keeps coding-agent terminals alive (herdr.dev)
+adapters install ghostty  # terminal emulator (ghostty.org)
+
 # 2) Log in to the providers you care about
 claude login    # Claude Pro/Max OAuth
 grok login      # Grok session
@@ -119,7 +123,17 @@ Or just run **`adapters`** with no args for the interactive menu.
 
 ### Install targets
 
-`all` · `cliproxy` · `litellm` · `openai-oauth` · `claude` · `grok` · `codex` · `login-agents`
+`all` · `cliproxy` · `litellm` · `openai-oauth` · `claude` · `grok` · `codex` · `herdr` · `ghostty` · `login-agents`
+
+### Extra tools
+
+| Target | Tool | Why |
+|--------|------|-----|
+| `herdr` | [herdr.dev](https://herdr.dev) | Agent runtime — holds real terminals open so coding-agent work survives a closed lid; reattach from anywhere |
+| `ghostty` | [ghostty.org](https://ghostty.org) | Fast GPU terminal emulator (`.deb` from [`mkasberg/ghostty-ubuntu`](https://github.com/mkasberg/ghostty-ubuntu/releases)) |
+
+`adapters install ghostty` picks the right `.deb` for your distro (Debian `trixie`/`bookworm`, Ubuntu `24.04`/`25.10`/`26.04`; `amd64`/`arm64`).
+Override the version with `GHOSTTY_VERSION=1.3.1 adapters install ghostty`.
 
 ### Start / stop targets
 

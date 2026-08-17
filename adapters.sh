@@ -1305,6 +1305,55 @@ install_herdr() {
   fi
 }
 
+install_ghostty() {
+  local version="${GHOSTTY_VERSION:-1.3.1}"
+  log "install ghostty $version (terminal emulator — ghostty.org)"
+  if has_cmd ghostty; then
+    log "already installed: $(command -v ghostty)"
+    return 0
+  fi
+  need_cmd curl
+  need_cmd apt-get
+  local arch codename asset url deb
+  case "$(uname -m)" in
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *) die "unsupported architecture for ghostty: $(uname -m)" ;;
+  esac
+  # Map distro → release asset suffix (mkasberg/ghostty-ubuntu publishes per-codename debs)
+  codename="trixie"
+  if [[ -r /etc/os-release ]]; then
+    local id vid
+    id="$(. /etc/os-release; printf '%s' "$ID")"
+    vid="$(. /etc/os-release; printf '%s' "$VERSION_CODENAME")"
+    if [[ "$id" == "ubuntu" ]]; then
+      codename="$(. /etc/os-release; printf '%s' "$VERSION_ID")"   # 24.04 / 25.10 / 26.04
+    elif [[ -n "$vid" ]]; then
+      codename="$vid"                                                 # trixie / bookworm
+    fi
+  fi
+  asset="ghostty_${version}-0.ppa2_${arch}_${codename}.deb"
+  url="https://github.com/mkasberg/ghostty-ubuntu/releases/download/${version}-0-ppa2/${asset}"
+  deb="$(mktemp --suffix=.deb)"
+  log "curl -fsSL -o $deb $url"
+  if ! curl -fsSL -o "$deb" "$url"; then
+    rm -f "$deb"
+    die "ghostty download failed: $url (no build for $codename? set GHOSTTY_VERSION or use trixie/24.04)"
+  fi
+  log "sudo apt-get install -y $deb"
+  if ! sudo apt-get install -y "$deb"; then
+    rm -f "$deb"
+    die "ghostty install failed"
+  fi
+  rm -f "$deb"
+  hash -r 2>/dev/null || true
+  if has_cmd ghostty; then
+    log "ghostty installed: $(command -v ghostty)"
+  else
+    warn "ghostty install finished but binary not found"
+  fi
+}
+
 install_codex_cli() {
   log "install Codex CLI"
   if has_cmd codex; then
@@ -1480,13 +1529,14 @@ cmd_install() {
     grok|grok-cli) install_grok_cli ;;
     codex|codex-cli) install_codex_cli ;;
     herdr|herdr-cli) install_herdr ;;
+    ghostty|ghostty-term) install_ghostty ;;
     login-agents|logins)
       # install any missing login CLIs without prompting
       has_cmd claude || install_claude_cli
       resolve_grok_bin >/dev/null || install_grok_cli
       has_cmd codex || install_codex_cli
       ;;
-    *) die "unknown install target: $target (all|cliproxy|litellm|openai-oauth|claude|grok|codex|herdr|login-agents)" ;;
+    *) die "unknown install target: $target (all|cliproxy|litellm|openai-oauth|claude|grok|codex|herdr|ghostty|login-agents)" ;;
   esac
   echo
   log "done. Next: adapters.sh start …  or  adapters.sh use <profile>"
@@ -2910,6 +2960,33 @@ menu_pick_adapter_target() {
   esac
 }
 
+menu_pick_install_target() {
+  # prints all|cliproxy|litellm|openai-oauth|herdr|ghostty
+  local t choice
+  t="$(tty_path)"
+  {
+    echo
+    echo "  1) All adapters"
+    echo "  2) CLIProxy only   (:8317 Claude OAuth)"
+    echo "  3) LiteLLM only    (:4000)"
+    echo "  4) openai-oauth    (:10531 Codex)"
+    echo "  5) herdr           (agent runtime — herdr.dev)"
+    echo "  6) ghostty         (terminal emulator)"
+    echo "  0) Cancel"
+  } >"$t"
+  choice="$(prompt_line "Choose" "1")"
+  case "$choice" in
+    0|"") printf '%s' "" ;;
+    1) printf '%s' "all" ;;
+    2) printf '%s' "cliproxy" ;;
+    3) printf '%s' "litellm" ;;
+    4) printf '%s' "openai-oauth" ;;
+    5) printf '%s' "herdr" ;;
+    6) printf '%s' "ghostty" ;;
+    *) printf '%s' "all" ;;
+  esac
+}
+
 cmd_menu() {
   INTERACTIVE_MENU=1
   local t choice target
@@ -2970,7 +3047,7 @@ cmd_menu() {
         pause
         ;;
       5|install)
-        target="$(menu_pick_adapter_target)"
+        target="$(menu_pick_install_target)"
         if [[ -n "$target" ]]; then
           cmd_install "$target" || true
           pause
@@ -3023,7 +3100,7 @@ MENU PATH
   2 Switch provider → DeepSeek / Claude / Grok / OpenAI / …
   3 Change model → list from CLIProxy / current gateway
   4 Reasoning effort → high / medium / low / xhigh / off
-  5 Install adapters (CLIProxy / LiteLLM / openai-oauth / herdr)
+  5 Install adapters / tools (CLIProxy / LiteLLM / openai-oauth / herdr / ghostty)
   6 Start adapters
   7 Stop adapters
   8 Restart host
@@ -3039,7 +3116,7 @@ SCRIPTABLE
   adapters status
   adapters check-logins
   adapters effort high|medium|low|xhigh|off [--no-restart]
-  adapters install [all|cliproxy|litellm|openai-oauth|claude|grok|codex|herdr|login-agents]
+  adapters install [all|cliproxy|litellm|openai-oauth|claude|grok|codex|herdr|ghostty|login-agents]
   adapters start   [all|cliproxy|litellm|openai-oauth]
   adapters stop    [all|cliproxy|litellm|openai-oauth]
   adapters use deepseek|claude|grok-session|openai|openrouter|…
