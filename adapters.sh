@@ -1287,6 +1287,24 @@ install_grok_cli() {
   fi
 }
 
+install_herdr() {
+  log "install herdr (agent runtime — herdr.dev)"
+  if has_cmd herdr; then
+    log "already installed: $(command -v herdr)"
+    return 0
+  fi
+  need_cmd curl
+  log "curl -fsSL https://herdr.dev/install.sh | sh"
+  curl -fsSL https://herdr.dev/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+  hash -r 2>/dev/null || true
+  if has_cmd herdr; then
+    log "herdr installed: $(command -v herdr)"
+  else
+    warn "herdr install finished but binary not found — check https://herdr.dev"
+  fi
+}
+
 install_codex_cli() {
   log "install Codex CLI"
   if has_cmd codex; then
@@ -1461,13 +1479,14 @@ cmd_install() {
     claude|claude-cli) install_claude_cli ;;
     grok|grok-cli) install_grok_cli ;;
     codex|codex-cli) install_codex_cli ;;
+    herdr|herdr-cli) install_herdr ;;
     login-agents|logins)
       # install any missing login CLIs without prompting
       has_cmd claude || install_claude_cli
       resolve_grok_bin >/dev/null || install_grok_cli
       has_cmd codex || install_codex_cli
       ;;
-    *) die "unknown install target: $target (all|cliproxy|litellm|openai-oauth|claude|grok|codex|login-agents)" ;;
+    *) die "unknown install target: $target (all|cliproxy|litellm|openai-oauth|claude|grok|codex|herdr|login-agents)" ;;
   esac
   echo
   log "done. Next: adapters.sh start …  or  adapters.sh use <profile>"
@@ -3004,7 +3023,7 @@ MENU PATH
   2 Switch provider → DeepSeek / Claude / Grok / OpenAI / …
   3 Change model → list from CLIProxy / current gateway
   4 Reasoning effort → high / medium / low / xhigh / off
-  5 Install adapters (CLIProxy / LiteLLM / openai-oauth)
+  5 Install adapters (CLIProxy / LiteLLM / openai-oauth / herdr)
   6 Start adapters
   7 Stop adapters
   8 Restart host
@@ -3020,7 +3039,7 @@ SCRIPTABLE
   adapters status
   adapters check-logins
   adapters effort high|medium|low|xhigh|off [--no-restart]
-  adapters install [all|cliproxy|litellm|openai-oauth|claude|grok|codex|login-agents]
+  adapters install [all|cliproxy|litellm|openai-oauth|claude|grok|codex|herdr|login-agents]
   adapters start   [all|cliproxy|litellm|openai-oauth]
   adapters stop    [all|cliproxy|litellm|openai-oauth]
   adapters use deepseek|claude|grok-session|openai|openrouter|…
