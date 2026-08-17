@@ -76,6 +76,8 @@ adapters install login-agents
 adapters install herdr    # agent runtime — keeps coding-agent terminals alive (herdr.dev)
 adapters install ghostty  # terminal emulator (ghostty.org)
 adapters install tailscale  # mesh VPN — reach this box from anywhere (tailscale.com)
+adapters install zellij    # terminal multiplexer — sessions inside herdr (zellij.dev)
+adapters install lazygit   # TUI git client — fast repo work (github.com/jesseduffield/lazygit)
 
 # 2) Log in to the providers you care about
 claude login    # Claude Pro/Max OAuth
@@ -124,7 +126,7 @@ Or just run **`adapters`** with no args for the interactive menu.
 
 ### Install targets
 
-`all` · `cliproxy` · `litellm` · `openai-oauth` · `claude` · `grok` · `codex` · `herdr` · `ghostty` · `tailscale` · `login-agents`
+`all` · `cliproxy` · `litellm` · `openai-oauth` · `claude` · `grok` · `codex` · `herdr` · `ghostty` · `tailscale` · `zellij` · `lazygit` · `login-agents`
 
 ### Extra tools
 
@@ -133,6 +135,8 @@ Or just run **`adapters`** with no args for the interactive menu.
 | `herdr` | [herdr.dev](https://herdr.dev) | Agent runtime — holds real terminals open so coding-agent work survives a closed lid; reattach from anywhere |
 | `ghostty` | [ghostty.org](https://ghostty.org) | Fast GPU terminal emulator (`.deb` from [`mkasberg/ghostty-ubuntu`](https://github.com/mkasberg/ghostty-ubuntu/releases)) |
 | `tailscale` | [tailscale.com](https://tailscale.com) | Mesh VPN — reach this box securely from any device; pairs with herdr for always-attachable terminals |
+| `zellij` | [zellij.dev](https://zellij.dev) | Terminal multiplexer — run sessions inside herdr and reattach from anywhere (override version: `ZELLIJ_VERSION=v0.44.3`) |
+| `lazygit` | [github.com/jesseduffield/lazygit](https://github.com/jesseduffield/lazygit) | TUI git client — fast staging/committing on a headless box (apt / brew) |
 
 `adapters install tailscale` runs the official installer, then authenticate with `sudo tailscale up`.
 

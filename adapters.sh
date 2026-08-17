@@ -1372,6 +1372,70 @@ install_tailscale() {
   fi
 }
 
+install_zellij() {
+  local version="${ZELLIJ_VERSION:-v0.44.3}"
+  log "install zellij $version (terminal multiplexer — zellij.dev)"
+  if has_cmd zellij; then
+    log "already installed: $(command -v zellij)"
+    return 0
+  fi
+  if [[ "$(uname -s)" == "Darwin" ]] && has_cmd brew; then
+    log "brew install zellij"
+    brew install zellij
+  else
+    need_cmd curl
+    local arch url tmp
+    case "$(uname -m)" in
+      x86_64|amd64) arch="x86_64-unknown-linux-musl" ;;
+      aarch64|arm64) arch="aarch64-unknown-linux-musl" ;;
+      *) die "unsupported architecture for zellij: $(uname -m)" ;;
+    esac
+    url="https://github.com/zellij-org/zellij/releases/download/${version}/zellij-${arch}.tar.gz"
+    tmp="$(mktemp -d)"
+    log "curl -fsSL $url | tar -xz -C $tmp"
+    if ! curl -fsSL "$url" | tar -xz -C "$tmp"; then
+      rm -rf "$tmp"
+      die "zellij download failed: $url (set ZELLIJ_VERSION for a newer release)"
+    fi
+    mkdir -p "$HOME/.local/bin"
+    install -m 0755 "$tmp/zellij" "$HOME/.local/bin/zellij"
+    rm -rf "$tmp"
+    export PATH="$HOME/.local/bin:$PATH"
+  fi
+  hash -r 2>/dev/null || true
+  if has_cmd zellij; then
+    log "zellij installed: $(command -v zellij)"
+  else
+    warn "zellij install finished but binary not found — add ~/.local/bin to PATH"
+  fi
+}
+
+install_lazygit() {
+  log "install lazygit (TUI git client — github.com/jesseduffield/lazygit)"
+  if has_cmd lazygit; then
+    log "already installed: $(command -v lazygit)"
+    return 0
+  fi
+  if [[ "$(uname -s)" == "Darwin" ]] && has_cmd brew; then
+    log "brew install lazygit"
+    brew install lazygit
+  else
+    need_cmd apt-get
+    log "sudo apt-get install -y lazygit"
+    if ! sudo apt-get install -y lazygit; then
+      # transient mirror 502s — retry once with --fix-missing
+      log "retry: sudo apt-get install -y --fix-missing lazygit"
+      sudo apt-get install -y --fix-missing lazygit || die "lazygit install failed (not in your distro repos? use the GitHub release)"
+    fi
+  fi
+  hash -r 2>/dev/null || true
+  if has_cmd lazygit; then
+    log "lazygit installed: $(command -v lazygit)"
+  else
+    warn "lazygit install finished but binary not found"
+  fi
+}
+
 install_codex_cli() {
   log "install Codex CLI"
   if has_cmd codex; then
@@ -1549,13 +1613,15 @@ cmd_install() {
     herdr|herdr-cli) install_herdr ;;
     ghostty|ghostty-term) install_ghostty ;;
     tailscale) install_tailscale ;;
+    zellij) install_zellij ;;
+    lazygit) install_lazygit ;;
     login-agents|logins)
       # install any missing login CLIs without prompting
       has_cmd claude || install_claude_cli
       resolve_grok_bin >/dev/null || install_grok_cli
       has_cmd codex || install_codex_cli
       ;;
-    *) die "unknown install target: $target (all|cliproxy|litellm|openai-oauth|claude|grok|codex|herdr|ghostty|tailscale|login-agents)" ;;
+    *) die "unknown install target: $target (all|cliproxy|litellm|openai-oauth|claude|grok|codex|herdr|ghostty|tailscale|zellij|lazygit|login-agents)" ;;
   esac
   echo
   log "done. Next: adapters.sh start …  or  adapters.sh use <profile>"
@@ -2992,6 +3058,8 @@ menu_pick_install_target() {
     echo "  5) herdr           (agent runtime — herdr.dev)"
     echo "  6) ghostty         (terminal emulator)"
     echo "  7) tailscale       (mesh VPN — remote access)"
+    echo "  8) zellij          (terminal multiplexer)"
+    echo "  9) lazygit         (TUI git client)"
     echo "  0) Cancel"
   } >"$t"
   choice="$(prompt_line "Choose" "1")"
@@ -3004,6 +3072,8 @@ menu_pick_install_target() {
     5) printf '%s' "herdr" ;;
     6) printf '%s' "ghostty" ;;
     7) printf '%s' "tailscale" ;;
+    8) printf '%s' "zellij" ;;
+    9) printf '%s' "lazygit" ;;
     *) printf '%s' "all" ;;
   esac
 }
@@ -3121,7 +3191,7 @@ MENU PATH
   2 Switch provider → DeepSeek / Claude / Grok / OpenAI / …
   3 Change model → list from CLIProxy / current gateway
   4 Reasoning effort → high / medium / low / xhigh / off
-  5 Install adapters / tools (CLIProxy / LiteLLM / openai-oauth / herdr / ghostty / tailscale)
+  5 Install adapters / tools (CLIProxy / LiteLLM / openai-oauth / herdr / ghostty / tailscale / zellij / lazygit)
   6 Start adapters
   7 Stop adapters
   8 Restart host
@@ -3137,7 +3207,7 @@ SCRIPTABLE
   adapters status
   adapters check-logins
   adapters effort high|medium|low|xhigh|off [--no-restart]
-  adapters install [all|cliproxy|litellm|openai-oauth|claude|grok|codex|herdr|ghostty|tailscale|login-agents]
+  adapters install [all|cliproxy|litellm|openai-oauth|claude|grok|codex|herdr|ghostty|tailscale|zellij|lazygit|login-agents]
   adapters start   [all|cliproxy|litellm|openai-oauth]
   adapters stop    [all|cliproxy|litellm|openai-oauth]
   adapters use deepseek|claude|grok-session|openai|openrouter|…
