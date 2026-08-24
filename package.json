@@ -33,6 +33,9 @@
     "scripts/ensure-xai-inference.sh",
     "scripts/restore-after-reset.sh",
     "scripts/bootstrap.sh",
+    "scripts/host-hook-watchdog.sh",
+    "scripts/refresh-grok-if-expired.sh",
+    "scripts/token-expired.py",
     "examples/cliproxy-openai-compat.yaml",
     "docs/GUIDE_CUSTOM_INFERENCE.md",
     "README.md",
@@ -49,6 +52,6 @@
   "scripts": {
     "adapters": "bash ./adapters.sh",
     "prepack": "test -x adapters.sh",
-    "test": "bash -n adapters.sh && bash -n adapters && bash -n scripts/ensure-xai-inference.sh && bash -n scripts/restore-after-reset.sh && bash -n scripts/bootstrap.sh && bash ./adapters.sh help >/dev/null"
+    "test": "bash -n adapters.sh && bash -n adapters && bash -n scripts/ensure-xai-inference.sh && bash -n scripts/restore-after-reset.sh && bash -n scripts/bootstrap.sh && bash -n scripts/host-hook-watchdog.sh && bash -n scripts/refresh-grok-if-expired.sh && bash ./adapters.sh help >/dev/null"
   }
 }

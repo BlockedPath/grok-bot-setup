@@ -44,6 +44,7 @@ _adapters_data_dir() {
 }
 ADAPTERS_DATA="$(_adapters_data_dir)"
 CLIPROXY_DIR="${CLIPROXY_DIR:-$ADAPTERS_DATA/cliproxy-api}"
+HOST_HOOK_DIR="${HOST_HOOK_DIR:-$ADAPTERS_DATA/host-hook-watchdog}"
 LITELLM_DIR="${LITELLM_DIR:-$ADAPTERS_DATA/grok-model-bridge}"
 CLIPROXY_BIN="${CLIPROXY_BIN:-$HOME/go/bin/server}"
 CLIPROXY_PORT="${CLIPROXY_PORT:-8317}"
@@ -236,6 +237,11 @@ PY
     echo "cliproxy watchdog: running (pid $pid)"
   else
     echo "cliproxy watchdog: not running"
+  fi
+  if host_hook_watchdog_alive; then
+    echo "host-hook watchdog: running (pid $(cat "$HOST_HOOK_DIR/watchdog.pid"))"
+  else
+    echo "host-hook watchdog: not running"
   fi
   command -v litellm >/dev/null 2>&1 && echo "litellm:     OK ($(command -v litellm))" || echo "litellm:     not on PATH (uvx fallback ok)"
   command -v npx >/dev/null 2>&1 && echo "npx:         OK" || echo "npx:         MISSING"
@@ -1634,6 +1640,44 @@ cliproxy_watchdog_alive() {
   pid="$(cat "$pidfile" 2>/dev/null || true)"
   [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null
+}
+
+host_hook_watchdog_alive() {
+  local pidfile="$HOST_HOOK_DIR/watchdog.pid" pid
+  [[ -f "$pidfile" ]] || return 1
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+install_host_hook_watchdog() {
+  local src="$ROOT/scripts/host-hook-watchdog.sh"
+  if [[ ! -f "$src" ]]; then
+    warn "missing $src — host-hook watchdog not installed"
+    return 1
+  fi
+  mkdir -p "$HOST_HOOK_DIR"
+  cp "$src" "$HOST_HOOK_DIR/watchdog.sh"
+  chmod +x "$HOST_HOOK_DIR/watchdog.sh"
+  if [[ -f "$ROOT/scripts/refresh-grok-if-expired.sh" ]]; then
+    cp "$ROOT/scripts/refresh-grok-if-expired.sh" "$HOST_HOOK_DIR/refresh-grok-if-expired.sh"
+    chmod +x "$HOST_HOOK_DIR/refresh-grok-if-expired.sh"
+  fi
+  if [[ -f "$ROOT/scripts/token-expired.py" ]]; then
+    cp "$ROOT/scripts/token-expired.py" "$HOST_HOOK_DIR/token-expired.py"
+    chmod +x "$HOST_HOOK_DIR/token-expired.py"
+  fi
+}
+
+start_host_hook_watchdog() {
+  install_host_hook_watchdog || return 1
+  if host_hook_watchdog_alive; then
+    log "host-hook watchdog already running"
+    return 0
+  fi
+  rm -f "$HOST_HOOK_DIR/watchdog.pid"
+  nohup "$HOST_HOOK_DIR/watchdog.sh" >>/tmp/sand-xai-watchdog.log 2>&1 &
+  log "host-hook watchdog started (pid $! log /tmp/sand-xai-watchdog.log)"
 }
 
 start_cliproxy() {
@@ -3247,7 +3291,7 @@ EOF
 # Rebuild host hook + CLIProxy after a sand-host / sand-data wipe.
 cmd_recover() {
   log "recover custom inference after a sand reset"
-  chmod +x "$ROOT/adapters" "$ROOT/adapters.sh" "$ROOT/scripts/ensure-xai-inference.sh" 2>/dev/null || true
+  chmod +x "$ROOT/adapters" "$ROOT/adapters.sh" "$ROOT/scripts/ensure-xai-inference.sh" "$ROOT/scripts/host-hook-watchdog.sh" "$ROOT/scripts/refresh-grok-if-expired.sh" 2>/dev/null || true
   mkdir -p "$HOME/.local/bin"
   cat >"$HOME/.local/bin/adapters" <<EOF
 #!/bin/sh
@@ -3271,6 +3315,7 @@ EOF
 
   install_cliproxy
   start_cliproxy || warn "cliproxy start failed — adapters start cliproxy"
+  start_host_hook_watchdog || warn "host-hook watchdog start failed"
 
   if [[ -f "$ENV_FILE" ]]; then
     cmd_restart_host || warn "host restart failed"
