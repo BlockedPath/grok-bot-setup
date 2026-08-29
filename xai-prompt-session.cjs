@@ -285,6 +285,19 @@ function parseArgs(raw) {
   }
 }
 
+function normalizeReturnedToolArgs(name, args) {
+  if (name !== "SendToUser" || !isPlainObject(args)) return args;
+  const allowed = {
+    text: ["type", "content", "images", "reply_to", "channel", "to"],
+    attachment: ["type", "url", "alt", "reply_to", "channel"],
+    widget: ["type", "widget", "reply_to"],
+    "cursor-agent": ["type", "bcId", "reply_to"],
+    "secret-request": ["type", "secret", "reply_to"],
+  }[args.type];
+  if (!allowed) return args;
+  return Object.fromEntries(Object.entries(args).filter(([key]) => allowed.includes(key)));
+}
+
 function convertContentPart(part) {
   const p = unwrapRedacted(part);
   if (p == null) return null;
@@ -849,23 +862,9 @@ async function runStream({ model, messages, tools, invocationId, auth }) {
             const fn = tc.function || {};
             if (fn.name) {
               acc.name = sanitizeToolName(fn.name);
-              if (!acc.started) {
-                acc.started = true;
-                push({
-                  type: "tool-call-streaming-start",
-                  toolCallId: acc.id || `call_${idx}`,
-                  toolName: acc.name,
-                });
-              }
             }
             if (fn.arguments) {
               acc.args += fn.arguments;
-              push({
-                type: "tool-call-delta",
-                toolCallId: acc.id || `call_${idx}`,
-                toolName: acc.name || "tool",
-                argsTextDelta: fn.arguments,
-              });
             }
           }
         }
@@ -880,7 +879,7 @@ async function runStream({ model, messages, tools, invocationId, auth }) {
   for (const acc of toolAcc.values()) {
     const id = acc.id || sanitizeToolId(`call_${toolCalls.length}`);
     const name = acc.name || "tool";
-    const args = parseArgs(acc.args);
+    const args = normalizeReturnedToolArgs(name, parseArgs(acc.args));
     toolCalls.push({ id, name, args });
     push({ type: "tool-call", toolCallId: id, toolName: name, args });
   }
@@ -997,6 +996,7 @@ module.exports = {
   createXaiPromptSession,
   convertMessages,
   normalizeToolParameters,
+  normalizeReturnedToolArgs,
   mapModelId,
   trimConvertedMessages,
 };
