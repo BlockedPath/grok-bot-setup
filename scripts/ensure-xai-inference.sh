@@ -85,7 +85,8 @@ hook = """      const requestedModel = resolveSandRequestedModel({
             sessionOptions
           });
         } catch (xaiErr) {
-          console.error("[sand-xai] failed to create xAI session, falling back to Cursor:", xaiErr);
+          console.error("[sand-xai] failed to create xAI session (fail-closed, no Cursor fallback):", xaiErr);
+          throw xaiErr;
         }
       }
       const session = createCursorInferencePromptSession({"""
@@ -107,7 +108,8 @@ if needle not in text:
             sessionOptions
           });
         } catch (xaiErr) {
-          console.error("[sand-xai] failed to create xAI session, falling back to Cursor:", xaiErr);
+          console.error("[sand-xai] failed to create xAI session (fail-closed, no Cursor fallback):", xaiErr);
+          throw xaiErr;
         }
       }
 """ + anchor_tail,

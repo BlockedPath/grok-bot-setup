@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "default": {
+    "provider": "grok-heavy",
+    "model": "grok-4.6",
+    "effort": "medium"
+  },
+  "agents": {
+    "5cadd652-c086-4ef2-8b64-e9c466e848b8": {
+      "label": "cos",
+      "provider": "grok-heavy",
+      "model": "grok-4.6",
+      "effort": "high"
+    },
+    "7a4ecb2d-9742-493e-bffb-87deb7a722b1": {
+      "label": "development",
+      "provider": "grok-heavy",
+      "model": "grok-4.6",
+      "effort": "high"
+    },
+    "01da7977-b202-4a08-a775-834768e6150e": {
+      "label": "finance",
+      "provider": "grok-heavy",
+      "model": "grok-4.6",
+      "effort": "low"
+    },
+    "8ae9a103-cfa2-406d-9bf3-eea00ca5b3a9": {
+      "label": "pump",
+      "provider": "codex",
+      "model": "gpt-5.4-mini"
+    }
+  }
+}
