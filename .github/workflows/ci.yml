@@ -29,6 +29,9 @@ jobs:
           set -euo pipefail
           bash -n adapters.sh
           bash -n adapters
+          bash -n bin/fleet-heavy
+          bash -n bin/fleet-status
+          bash -n scripts/test-fleet-heavy.sh
           echo "bash -n OK"
 
       - name: ShellCheck
@@ -37,16 +40,22 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
           # Fail on errors only; warnings are noisy for a large interactive CLI.
-          shellcheck -S error adapters.sh adapters
+          shellcheck -S error adapters.sh adapters bin/fleet-heavy bin/fleet-status scripts/test-fleet-heavy.sh
           echo "shellcheck OK"
 
       - name: CLI help smoke test
         run: |
           set -euo pipefail
-          chmod +x adapters adapters.sh
+          chmod +x adapters adapters.sh bin/fleet-heavy bin/fleet-status scripts/test-fleet-heavy.sh
           ./adapters help | grep -q "Grok Bot adapters CLI"
           ./adapters.sh help | grep -q "npm"
           echo "help OK"
+
+      - name: Fleet-heavy stub tests
+        run: |
+          set -euo pipefail
+          bash ./scripts/test-fleet-heavy.sh
+          echo "fleet-heavy stub tests OK"
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -96,5 +105,9 @@ jobs:
           set -euo pipefail
           bash -n adapters.sh
           bash -n adapters
-          chmod +x adapters adapters.sh
+          bash -n bin/fleet-heavy
+          bash -n bin/fleet-status
+          bash -n scripts/test-fleet-heavy.sh
+          chmod +x adapters adapters.sh bin/fleet-heavy bin/fleet-status scripts/test-fleet-heavy.sh
           ./adapters help | grep -q "Grok Bot adapters CLI"
+          bash ./scripts/test-fleet-heavy.sh

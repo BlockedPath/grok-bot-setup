@@ -33,6 +33,10 @@
     "scripts/ensure-xai-inference.sh",
     "scripts/restore-after-reset.sh",
     "scripts/bootstrap.sh",
+    "scripts/test-fleet-heavy.sh",
+    "bin/fleet-heavy",
+    "bin/fleet-status",
+    "docs/FLEET_HEAVY_CUTOVER.md",
     "examples/cliproxy-openai-compat.yaml",
     "docs/GUIDE_CUSTOM_INFERENCE.md",
     "README.md",
@@ -49,6 +53,6 @@
   "scripts": {
     "adapters": "bash ./adapters.sh",
     "prepack": "test -x adapters.sh",
-    "test": "bash -n adapters.sh && bash -n adapters && bash -n scripts/ensure-xai-inference.sh && bash -n scripts/restore-after-reset.sh && bash -n scripts/bootstrap.sh && bash ./adapters.sh help >/dev/null"
+    "test": "bash -n adapters.sh && bash -n adapters && bash -n bin/fleet-heavy && bash -n bin/fleet-status && bash -n scripts/ensure-xai-inference.sh && bash -n scripts/restore-after-reset.sh && bash -n scripts/bootstrap.sh && bash -n scripts/test-fleet-heavy.sh && bash ./adapters.sh help >/dev/null && bash ./scripts/test-fleet-heavy.sh"
   }
 }

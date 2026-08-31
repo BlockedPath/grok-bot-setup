@@ -124,6 +124,19 @@ Or just run **`adapters`** with no args for the interactive menu.
 | `adapters restart-host` | Restart Sand host to pick up config |
 | `adapters help` | Full help |
 
+### Fleet Heavy (office cutover)
+
+Wrapper around `adapters use grok-session`. Default is **dry-run**. Live flick needs `--i-am-outside-chat` and `--go`, and it restarts every office agent on this computer. Never run it from a Grok Bot chat.
+
+```bash
+./bin/fleet-heavy --i-am-outside-chat          # preflight only
+./bin/fleet-status                             # same preflight
+./bin/fleet-heavy --i-am-outside-chat --go     # live. After Ricky GO, not from CoS.
+bash ./scripts/test-fleet-heavy.sh             # stub adapters only; never hits the live host
+```
+
+Story, blast radius, and the why-last-time-crashed notes: [`docs/FLEET_HEAVY_CUTOVER.md`](docs/FLEET_HEAVY_CUTOVER.md).
+
 ### Install targets
 
 `all` · `cliproxy` · `litellm` · `openai-oauth` · `claude` · `grok` · `codex` · `herdr` · `ghostty` · `tailscale` · `zellij` · `lazygit` · `login-agents`
