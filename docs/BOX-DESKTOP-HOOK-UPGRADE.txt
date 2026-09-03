@@ -1,0 +1,16 @@
+Open this file as RAW text. Copy from the browser, not from chat.
+
+On box@cursor desktop terminal, run these four lines (type if paste still dies):
+
+cd /home/box/grok-bot-setup
+
+git fetch https://github.com/BlockedPath/grok-bot-setup.git refs/pull/5/head
+
+git checkout FETCH_HEAD -- scripts/box-desktop-hook-upgrade.sh
+
+bash scripts/box-desktop-hook-upgrade.sh
+
+Want: upgraded hook to pass hostOptions
+Then hard-refresh Grok Bot, ping CoS, grep sand-xai /tmp/sand-host-manual.log
+Comment hostOptions keys on https://github.com/BlockedPath/grok-bot-setup/pull/5
+No Pump Codex. No CoS-chat restart.

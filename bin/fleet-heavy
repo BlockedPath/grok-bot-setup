@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+# fleet-heavy — dry-run wrapper around adapters.sh use grok-session.
+# Default is dry-run. Live needs --i-am-outside-chat AND --go.
+# Never run this from a Grok Bot chat (CoS included). Tests never call live adapters.
+set -euo pipefail
+
+_script_dir() {
+  local src="${BASH_SOURCE[0]}"
+  local dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+ROOT="$(cd "$(_script_dir)/.." && pwd)"
+ADAPTERS="$ROOT/adapters.sh"
+AGENT_DATA="$HOME/agent-data"
+TRANSCRIPTS="$AGENT_DATA/agent-transcripts"
+AUTH_FILE="$HOME/.grok/auth.json"
+HOT_SECONDS=15
+WATCHDOG_PIDFILE="${HOST_HOOK_DIR:-$HOME/.local/share/grok-bot-adapters/host-hook-watchdog}/watchdog.pid"
+COS_JSONL_WARN_BYTES=41943040
+MODEL="grok-4.6"
+EFFORT="medium"
+
+# Test harness only. Production cutover ignores these overrides.
+if [[ "${FLEET_ALLOW_TEST_OVERRIDES:-}" == "1" ]]; then
+  ADAPTERS="${FLEET_ADAPTERS:-$ADAPTERS}"
+  AGENT_DATA="${FLEET_AGENT_DATA:-$AGENT_DATA}"
+  TRANSCRIPTS="${FLEET_TRANSCRIPTS:-$AGENT_DATA/agent-transcripts}"
+  AUTH_FILE="${FLEET_GROK_AUTH:-$AUTH_FILE}"
+  HOT_SECONDS="${FLEET_HOT_SECONDS:-$HOT_SECONDS}"
+  WATCHDOG_PIDFILE="${FLEET_WATCHDOG_PIDFILE:-$WATCHDOG_PIDFILE}"
+  COS_JSONL_WARN_BYTES="${FLEET_COS_WARN_BYTES:-$COS_JSONL_WARN_BYTES}"
+  MODEL="${FLEET_MODEL:-$MODEL}"
+  EFFORT="${FLEET_EFFORT:-$EFFORT}"
+fi
+
+WANT_GO=0
+OUTSIDE_CHAT=0
+MODE="cutover"
+EXIT_REFUSE=2
+# Epoch at cutover start — refuse if any jsonl mutates during slow preflight
+# (hot window alone can miss writes when preflight lasts longer than HOT_SECONDS).
+CUTOVER_T0=""
+
+log()  { printf '+ %s\n' "$*"; }
+warn() { printf '! %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+refuse() { printf 'REFUSE: %s\n' "$*" >&2; exit "$EXIT_REFUSE"; }
+
+usage() {
+  cat <<'EOF'
+fleet-heavy — office-wide SuperGrok Heavy cutover (wrapper around adapters)
+
+Default is dry-run. Does not restart the host.
+
+  fleet-heavy --i-am-outside-chat           # preflight, print the adapters command
+  fleet-heavy --i-am-outside-chat --go      # live flick. Restarts every office agent.
+  fleet-heavy status                        # preflight only
+  fleet-heavy --help
+
+Must refuse if: missing --i-am-outside-chat, running under sand-host,
+Grok-session recover is enabled, host-hook watchdog is running,
+~/.grok/auth.json missing, or any office jsonl is hot (mid-turn).
+
+Live command (after preflight):
+  adapters.sh use grok-session --model grok-4.6 --effort medium
+
+Never run from CoS. Never Sign Out of Cursor. Tests must stub adapters
+and must not pass --go against the live host.
+EOF
+}
+
+inside_sand() {
+  if test_overrides_allowed; then
+    if [[ "${FLEET_FORCE_INSIDE:-}" == "1" ]]; then
+      return 0
+    fi
+    if [[ "${FLEET_FORCE_OUTSIDE:-}" == "1" ]]; then
+      return 1
+    fi
+  fi
+  local p="${PPID:-}"
+  local i=0
+  local cmd
+  while [[ "$i" -lt 32 && -n "$p" && "$p" != "0" && "$p" != "1" ]]; do
+    cmd=""
+    if [[ -r "/proc/$p/cmdline" ]]; then
+      cmd="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null || true)"
+    fi
+    if [[ "$cmd" == *host-main.cjs* || "$cmd" == *sand-host* ]]; then
+      return 0
+    fi
+    if [[ -r "/proc/$p/status" ]]; then
+      p="$(awk '/^PPid:/{print $2}' "/proc/$p/status" 2>/dev/null || echo 1)"
+    else
+      break
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+test_overrides_allowed() {
+  [[ "${FLEET_ALLOW_TEST_OVERRIDES:-}" == "1" ]]
+}
+
+# 0 = enabled, 1 = disabled, 2 = unreadable/invalid (caller must refuse on cutover)
+json_enabled() {
+  python3 -c '
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(2)
+sys.exit(0 if d.get("enabled") else 1)
+' "$1"
+}
+
+recover_enabled() {
+  local f rc
+  if test_overrides_allowed && [[ -n "${FLEET_RECOVER_JSON:-}" ]]; then
+    if [[ ! -f "${FLEET_RECOVER_JSON}" ]]; then
+      return 1
+    fi
+    json_enabled "$FLEET_RECOVER_JSON"
+    rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      printf '%s\n' "$FLEET_RECOVER_JSON"
+      return 0
+    fi
+    if [[ "$rc" -eq 2 ]]; then
+      printf 'INVALID:%s\n' "$FLEET_RECOVER_JSON"
+      return 0
+    fi
+    return 1
+  fi
+  if [[ ! -d "$AGENT_DATA" ]]; then
+    # Missing agent-data is handled by enforce_office_state; here treat as no recover.
+    return 1
+  fi
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    json_enabled "$f"
+    rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      printf '%s\n' "$f"
+      return 0
+    fi
+    if [[ "$rc" -eq 2 ]]; then
+      printf 'INVALID:%s\n' "$f"
+      return 0
+    fi
+  done < <(find "$AGENT_DATA" -path '*/automations/grok-session-recover/automation.json' 2>/dev/null || true)
+  return 1
+}
+
+watchdog_running() {
+  local pid
+  [[ -f "$WATCHDOG_PIDFILE" ]] || return 1
+  pid="$(tr -d '[:space:]' < "$WATCHDOG_PIDFILE")"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+hot_jsonls() {
+  if [[ ! -d "$TRANSCRIPTS" ]]; then
+    return 0
+  fi
+  find "$TRANSCRIPTS" -name '*.jsonl' -newermt "-${HOT_SECONDS} seconds" 2>/dev/null || true
+}
+
+# jsonl mtime >= cutover start (at or after). find -newermt is strictly after.
+mutated_since_t0() {
+  if [[ -z "${CUTOVER_T0:-}" || ! -d "$TRANSCRIPTS" ]]; then
+    return 0
+  fi
+  python3 -c '
+import os,sys
+root,t0=sys.argv[1],int(sys.argv[2])
+hits=[]
+for dirpath,_,files in os.walk(root):
+    for name in files:
+        if not name.endswith(".jsonl"):
+            continue
+        path=os.path.join(dirpath,name)
+        try:
+            m=int(os.path.getmtime(path))
+        except OSError:
+            hits.append(path+":UNREADABLE")
+            continue
+        if m>=t0:
+            hits.append(path)
+for h in sorted(hits):
+    print(h)
+' "$TRANSCRIPTS" "$CUTOVER_T0" 2>/dev/null || true
+}
+
+jsonl_table() {
+  local f size name
+  if [[ ! -d "$TRANSCRIPTS" ]]; then
+    printf '(no transcripts at %s)\n' "$TRANSCRIPTS"
+    return 0
+  fi
+  printf '%-12s %s\n' "MiB" "jsonl"
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    size="$(wc -c < "$f" | tr -d ' ')"
+    name="${f#"$TRANSCRIPTS"/}"
+    awk -v s="$size" -v n="$name" -v warn="$COS_JSONL_WARN_BYTES" 'BEGIN {
+      mib = s / 1048576
+      flag = (s > warn) ? "  WARN>40MiB" : ""
+      printf "%8.1f    %s%s\n", mib, n, flag
+    }'
+  done < <(find "$TRANSCRIPTS" -name '*.jsonl' -type f 2>/dev/null | sort)
+}
+
+adapters_status() {
+  if [[ -x "$ADAPTERS" || -f "$ADAPTERS" ]]; then
+    "$ADAPTERS" status 2>/dev/null || true
+  else
+    warn "adapters missing at $ADAPTERS"
+  fi
+}
+
+live_cmd() {
+  printf '%s use grok-session --model %s --effort %s' "$ADAPTERS" "$MODEL" "$EFFORT"
+}
+
+preflight() {
+  local rec hot
+  printf '== fleet-heavy preflight ==\n'
+  printf 'mode: %s\n' "$MODE"
+  printf 'adapters: %s\n' "$ADAPTERS"
+  printf 'auth: %s\n' "$AUTH_FILE"
+  printf 'watchdog pidfile: %s\n' "$WATCHDOG_PIDFILE"
+  printf 'transcripts: %s\n' "$TRANSCRIPTS"
+  printf '\n-- adapters status --\n'
+  adapters_status
+  printf '\n-- office jsonl --\n'
+  jsonl_table
+  printf '\n-- gates --\n'
+  if inside_sand; then
+    printf 'inside sand-host: YES\n'
+  else
+    printf 'inside sand-host: no\n'
+  fi
+  rec="$(recover_enabled || true)"
+  if [[ -n "${rec:-}" ]]; then
+    printf 'grok-session recover: ENABLED (%s)\n' "$rec"
+  else
+    printf 'grok-session recover: paused/absent\n'
+  fi
+  if watchdog_running; then
+    printf 'host-hook watchdog: RUNNING (pid %s)\n' "$(tr -d '[:space:]' < "$WATCHDOG_PIDFILE")"
+  else
+    printf 'host-hook watchdog: down\n'
+  fi
+  if [[ -f "$AUTH_FILE" ]]; then
+    printf 'grok oauth: present\n'
+  else
+    printf 'grok oauth: MISSING\n'
+  fi
+  hot="$(hot_jsonls)"
+  if [[ -n "$hot" ]]; then
+    printf 'hot jsonl (last %ss):\n%s\n' "$HOT_SECONDS" "$hot"
+  else
+    printf 'hot jsonl: none\n'
+  fi
+  printf '\nwould run:\n  %s\n' "$(live_cmd)"
+}
+
+enforce_gates() {
+  if [[ "$OUTSIDE_CHAT" -ne 1 ]]; then
+    refuse "missing --i-am-outside-chat. Run me from tmux or a box shell, not CoS."
+  fi
+  if inside_sand; then
+    refuse "running under sand-host. Run me from tmux or a box shell, not CoS."
+  fi
+  if [[ ! -d "$AGENT_DATA" ]]; then
+    refuse "agent-data missing or unreadable at $AGENT_DATA. Cannot prove recover is paused."
+  fi
+  if [[ ! -r "$AGENT_DATA" || ! -x "$AGENT_DATA" ]]; then
+    refuse "agent-data not readable/traversable at $AGENT_DATA. Cannot prove recover is paused."
+  fi
+  if [[ ! -d "$TRANSCRIPTS" ]]; then
+    refuse "transcripts missing or unreadable at $TRANSCRIPTS. Cannot prove office is idle."
+  fi
+  if [[ ! -r "$TRANSCRIPTS" || ! -x "$TRANSCRIPTS" ]]; then
+    refuse "transcripts not readable/traversable at $TRANSCRIPTS. Cannot prove office is idle."
+  fi
+  local rec
+  rec="$(recover_enabled || true)"
+  if [[ -n "${rec:-}" ]]; then
+    if [[ "$rec" == INVALID:* ]]; then
+      refuse "Grok-session recover JSON unreadable/invalid (${rec#INVALID:}). Fix or remove it; do not guess."
+    fi
+    refuse "Grok-session recover is enabled ($rec). Leave it paused."
+  fi
+  if watchdog_running; then
+    refuse "host-hook watchdog is running. It will auto-restart onto Heavy and fight you."
+  fi
+  if [[ ! -f "$AUTH_FILE" ]]; then
+    refuse "no grok oauth at $AUTH_FILE. Do not grok login from this wrapper. Stop and tell Ricky."
+  fi
+  local hot
+  hot="$(hot_jsonls)"
+  if [[ -n "$hot" ]]; then
+    refuse "office jsonl is hot (mid-turn). Idle first. Hot files:"$'\n'"$hot"
+  fi
+  local mutated
+  mutated="$(mutated_since_t0)"
+  if [[ -n "$mutated" ]]; then
+    refuse "office jsonl mutated at or after cutover start. Idle and re-run. Changed:"$'\n'"$mutated"
+  fi
+}
+
+run_go() {
+  enforce_gates
+  if [[ ! -f "$ADAPTERS" ]]; then
+    die "adapters not found: $ADAPTERS"
+  fi
+  log "live flick: $(live_cmd)"
+  "$ADAPTERS" use grok-session --model "$MODEL" --effort "$EFFORT"
+}
+
+parse_args() {
+  if [[ "${1:-}" == "status" ]]; then
+    MODE="status"
+    shift || true
+  fi
+  if [[ "${1:-}" == "help" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+  fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --i-am-outside-chat) OUTSIDE_CHAT=1; shift ;;
+      --go) WANT_GO=1; shift ;;
+      --help|-h) usage; exit 0 ;;
+      status) MODE="status"; shift ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+}
+
+main() {
+  parse_args "$@"
+  if [[ "$MODE" == "status" ]]; then
+    preflight
+    exit 0
+  fi
+  CUTOVER_T0="${FLEET_CUTOVER_T0:-$(date +%s)}"
+  if ! test_overrides_allowed; then
+    unset FLEET_CUTOVER_T0 2>/dev/null || true
+    CUTOVER_T0="$(date +%s)"
+  elif [[ -n "${FLEET_CUTOVER_T0:-}" ]]; then
+    CUTOVER_T0="$FLEET_CUTOVER_T0"
+  fi
+  preflight
+  enforce_gates
+  if [[ "$WANT_GO" -eq 1 ]]; then
+    run_go
+  else
+    log "dry-run only. Pass --go after you have read the preflight. This did not restart the host."
+  fi
+}
+
+main "$@"

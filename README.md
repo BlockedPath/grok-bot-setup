@@ -124,6 +124,33 @@ Or just run **`adapters`** with no args for the interactive menu.
 | `adapters restart-host` | Restart Sand host to pick up config |
 | `adapters help` | Full help |
 
+### Fleet Heavy (office cutover)
+
+Wrapper around `adapters use grok-session`. Default is **dry-run**. Live flick needs `--i-am-outside-chat` and `--go`, and it restarts every office agent on this computer. Never run it from a Grok Bot chat.
+
+```bash
+./bin/fleet-heavy --i-am-outside-chat          # preflight only
+./bin/fleet-status                             # same preflight
+./bin/fleet-heavy --i-am-outside-chat --go     # live. After Ricky GO, not from CoS.
+bash ./scripts/test-fleet-heavy.sh             # stub adapters only; never hits the live host
+```
+
+Story, blast radius, and the why-last-time-crashed notes: [`docs/FLEET_HEAVY_CUTOVER.md`](docs/FLEET_HEAVY_CUTOVER.md).
+
+### Grok OAuth keepalive (probe only)
+
+Host `/health` 200 does **not** mean the access `key` in `~/.grok/auth.json` is live. Probe before a weekly Cursor → Heavy cutover. Never from chat. Never `--go`.
+
+```bash
+./bin/grok-auth-status                 # exists / has_key / expires_at / ok|soon|EXPIRED
+./bin/grok-auth-cutover-status         # hook + oauth + watchdog pid + recover armed?
+bash ./scripts/refresh-grok-if-expired.sh   # skip, or grok models, or refresh-failed
+# if EXPIRED: /home/box/.grok/bin/grok login --device-auth   (human, desktop)
+bash ./scripts/test-grok-auth-keepalive.sh  # stub fixtures; never live login
+```
+
+Two doors (do not weld): hook missing → `adapters.sh recover` / `fleet-heavy --go` (Ricky, paused). Token dead → M1 / human device-auth. Do not start `host-hook-watchdog.sh` from the oauth path. Details: [`docs/GROK_AUTH_KEEPALIVE.md`](docs/GROK_AUTH_KEEPALIVE.md).
+
 ### Install targets
 
 `all` · `cliproxy` · `litellm` · `openai-oauth` · `claude` · `grok` · `codex` · `herdr` · `ghostty` · `tailscale` · `zellij` · `lazygit` · `login-agents`

@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# M5 — status only: hook + oauth + watchdog pid + recover armed?
+# Never --go. Never SIGTERM. Never start the watchdog. Never enable recover.
+set -euo pipefail
+
+_script_dir() {
+  local src="${BASH_SOURCE[0]}"
+  local dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+ROOT="$(cd "$(_script_dir)/.." && pwd)"
+AUTH="${GROK_AUTH_FILE:-$HOME/.grok/auth.json}"
+SAND_HOST="${SAND_HOST_DIR:-$HOME/sand-host}"
+AGENT_DATA="${HOME}/agent-data"
+WATCHDOG_PIDFILE="${HOST_HOOK_DIR:-$HOME/.local/share/grok-bot-adapters/host-hook-watchdog}/watchdog.pid"
+
+if [[ "${FLEET_ALLOW_TEST_OVERRIDES:-}" == "1" ]]; then
+  AGENT_DATA="${FLEET_AGENT_DATA:-$AGENT_DATA}"
+  WATCHDOG_PIDFILE="${FLEET_WATCHDOG_PIDFILE:-$WATCHDOG_PIDFILE}"
+  SAND_HOST="${SAND_HOST_DIR:-$SAND_HOST}"
+  AUTH="${GROK_AUTH_FILE:-$AUTH}"
+fi
+
+for arg in "$@"; do
+  case "$arg" in
+    --go|--i-am-outside-chat)
+      printf 'REFUSE: grok-auth-cutover-status never flicks. No --go.\n' >&2
+      exit 2
+      ;;
+    -h|--help|help)
+      cat <<'EOF'
+grok-auth-cutover-status — probe only (hook + oauth + watchdog + recover)
+
+Never --go. Never starts host-hook-watchdog. Never enables grok-session recover.
+If oauth is EXPIRED, exit 2. Human fix: grok login --device-auth (desktop).
+EOF
+      exit 0
+      ;;
+  esac
+done
+
+HOST_MAIN="$SAND_HOST/host-main.cjs"
+SESSION="$SAND_HOST/xai-prompt-session.cjs"
+if [[ -f "$HOST_MAIN" && -f "$SESSION" ]] && grep -q createXaiPromptSession "$HOST_MAIN" 2>/dev/null; then
+  printf 'hook: present\n'
+else
+  printf 'hook: missing\n'
+fi
+
+export GROK_AUTH_FILE="$AUTH"
+oauth_rc=0
+oauth_out="$("$ROOT/bin/grok-auth-status" 2>/dev/null)" || oauth_rc=$?
+printf 'oauth: %s\n' "$oauth_out"
+
+watchdog_running() {
+  local pid
+  [[ -f "$WATCHDOG_PIDFILE" ]] || return 1
+  pid="$(tr -d '[:space:]' < "$WATCHDOG_PIDFILE")"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+if watchdog_running; then
+  printf 'watchdog: alive pid=%s\n' "$(tr -d '[:space:]' < "$WATCHDOG_PIDFILE")"
+else
+  printf 'watchdog: down\n'
+fi
+
+recover_state="paused"
+if [[ -d "$AGENT_DATA" ]]; then
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    if python3 - "$f" <<'PY'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(2)
+sys.exit(0 if data.get("enabled") is True else 1)
+PY
+    then
+      recover_state="enabled"
+      break
+    fi
+  done < <(find "$AGENT_DATA" -path '*/automations/grok-session-recover/automation.json' 2>/dev/null || true)
+fi
+printf 'recover: %s\n' "$recover_state"
+
+if [[ "$oauth_rc" -eq 2 ]]; then
+  exit 2
+fi
+exit 0

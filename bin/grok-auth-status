@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# M1 — probe ~/.grok/auth.json. Never prints tokens. File script (no pasted python).
+# exit 0 ok, 1 soon (<2h), 2 expired/missing
+set -euo pipefail
+
+_script_dir() {
+  local src="${BASH_SOURCE[0]}"
+  local dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+ROOT="$(cd "$(_script_dir)/.." && pwd)"
+AUTH="${GROK_AUTH_FILE:-$HOME/.grok/auth.json}"
+exec python3 "$ROOT/scripts/token-expired.py" --probe "$AUTH"

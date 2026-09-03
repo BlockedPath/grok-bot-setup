@@ -53,6 +53,25 @@ backup = pathlib.Path(sys.argv[2])
 text = host_main.read_text(encoding="utf-8", errors="surrogateescape")
 
 if "createXaiPromptSession" in text:
+    old_call = """return createXaiPromptSession({
+            requestedModel,
+            onRequestId,
+            sessionOptions
+          });"""
+    new_call = """return createXaiPromptSession({
+            requestedModel,
+            onRequestId,
+            sessionOptions,
+            hostOptions: typeof options2 !== "undefined" ? options2 : undefined
+          });"""
+    if "hostOptions:" in text:
+        print("hook already present")
+        raise SystemExit(0)
+    if old_call in text:
+        text = text.replace(old_call, new_call, 1)
+        host_main.write_text(text, encoding="utf-8", errors="surrogateescape")
+        print("upgraded hook to pass hostOptions")
+        raise SystemExit(0)
     print("hook already present")
     raise SystemExit(0)
 
@@ -82,10 +101,12 @@ hook = """      const requestedModel = resolveSandRequestedModel({
           return createXaiPromptSession({
             requestedModel,
             onRequestId,
-            sessionOptions
+            sessionOptions,
+            hostOptions: typeof options2 !== "undefined" ? options2 : undefined
           });
         } catch (xaiErr) {
-          console.error("[sand-xai] failed to create xAI session, falling back to Cursor:", xaiErr);
+          console.error("[sand-xai] failed to create xAI session (fail-closed, no Cursor fallback):", xaiErr);
+          throw xaiErr;
         }
       }
       const session = createCursorInferencePromptSession({"""
@@ -104,10 +125,12 @@ if needle not in text:
           return createXaiPromptSession({
             requestedModel,
             onRequestId,
-            sessionOptions
+            sessionOptions,
+            hostOptions: typeof options2 !== "undefined" ? options2 : undefined
           });
         } catch (xaiErr) {
-          console.error("[sand-xai] failed to create xAI session, falling back to Cursor:", xaiErr);
+          console.error("[sand-xai] failed to create xAI session (fail-closed, no Cursor fallback):", xaiErr);
+          throw xaiErr;
         }
       }
 """ + anchor_tail,

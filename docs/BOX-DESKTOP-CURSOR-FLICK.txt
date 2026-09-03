@@ -1,0 +1,11 @@
+Desktop terminal on box@cursor ONLY. Not CoS chat. Not CoS Shell.
+
+PATH="$HOME/.local/bin:$HOME/.grok/bin:$PATH"
+
+/home/box/grok-bot-setup/adapters.sh use cursor
+
+/home/box/grok-bot-setup/adapters.sh status
+
+Want: SAND_INFERENCE_PROVIDER=cursor and sand-host :1340 UP
+Do not adapters recover. Do not unpause Pump. Do not Sign Out of Cursor.
+Hard-refresh Grok Bot if UI says Reconnecting.
