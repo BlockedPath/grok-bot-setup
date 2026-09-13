@@ -286,7 +286,6 @@ def cmd_publish(args: argparse.Namespace) -> None:
     mode = int(args.mode, 8) if args.mode else source.stat().st_mode & 0o777
     owner = owner_ids(args.owner) if args.owner else None
     temporary = None
-    linked = False
     try:
         descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
         with os.fdopen(descriptor, "wb") as output, source.open("rb") as input_file:
@@ -300,7 +299,6 @@ def cmd_publish(args: argparse.Namespace) -> None:
         # regular file, directory, or symlink. The completed temporary inode is
         # invisible at the target name until this operation succeeds.
         os.link(temporary, target, follow_symlinks=False)
-        linked = True
         directory_fd = os.open(target.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -310,11 +308,6 @@ def cmd_publish(args: argparse.Namespace) -> None:
         print(f"PRESERVED: target already exists: {target}", file=sys.stderr)
         raise SystemExit(17)
     except OSError as exc:
-        if linked:
-            try:
-                target.unlink()
-            except OSError:
-                pass
         fail(f"cannot publish {target}: {exc}")
     finally:
         if temporary:

@@ -97,6 +97,33 @@ module.cmd_publish(types.SimpleNamespace(
 ))
 `], {env: safeEnv}));
   assert.equal(fs.readFileSync(target, 'utf8'), 'snapshot bytes\n');
+
+  fs.unlinkSync(target);
+  ok(run('python3', ['-c', `
+import importlib.util, pathlib, types
+spec = importlib.util.spec_from_file_location("recovery_state", ${JSON.stringify(helper)})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+real_fsync = module.os.fsync
+calls = 0
+def failing_directory_fsync(descriptor):
+    global calls
+    calls += 1
+    if calls == 2:
+        raise OSError("synthetic post-link fsync failure")
+    return real_fsync(descriptor)
+module.os.fsync = failing_directory_fsync
+try:
+    module.cmd_publish(types.SimpleNamespace(
+        source=${JSON.stringify(source)}, target=${JSON.stringify(target)},
+        mode="600", owner=None,
+    ))
+except SystemExit as error:
+    assert error.code == 1
+else:
+    raise AssertionError("post-link failure was not propagated")
+assert pathlib.Path(${JSON.stringify(target)}).read_bytes() == pathlib.Path(${JSON.stringify(source)}).read_bytes()
+`], {env: safeEnv}));
   console.log('PASS: no-replace publication preserves concurrent files and rejects dangling/blocked targets');
 }
 
