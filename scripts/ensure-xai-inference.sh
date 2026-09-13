@@ -45,6 +45,21 @@ if [[ "$(readlink -f "$0" 2>/dev/null || echo "$0")" != "$(readlink -f "$SAND_HO
   chmod +x "$SAND_HOST/scripts/ensure-xai-inference.sh" 2>/dev/null || true
 fi
 
+python3 - "$HOST_MAIN" <<'PY'
+import pathlib, sys
+host_main = pathlib.Path(sys.argv[1])
+text = host_main.read_text(encoding="utf-8", errors="surrogateescape")
+old = 'SAND_DEFAULT_MODEL_ID = "grok-4.5"'
+new = 'SAND_DEFAULT_MODEL_ID = process.env.SAND_AGENT_MODEL || process.env.SAND_XAI_MODEL || "grok-4.6"'
+if old in text:
+    host_main.write_text(text.replace(old, new, 1), encoding="utf-8", errors="surrogateescape")
+    print("pinned SAND_DEFAULT_MODEL_ID to SAND_XAI_MODEL/grok-4.6")
+elif "SAND_DEFAULT_MODEL_ID = process.env.SAND_AGENT_MODEL" in text:
+    print("SAND_DEFAULT_MODEL_ID already follows env")
+else:
+    print("SAND_DEFAULT_MODEL_ID pin skipped (anchor missing)")
+PY
+
 python3 - "$HOST_MAIN" "$BACKUP" <<'PY'
 import pathlib, shutil, sys
 
@@ -56,26 +71,7 @@ if "createXaiPromptSession" in text:
     print("hook already present")
     raise SystemExit(0)
 
-anchor_tail = "      const session = createCursorInferencePromptSession({"
-needle = """      const requestedModel = resolveSandRequestedModel({
-        sessionOptions,
-        envModelOverride: process.env.SAND_AGENT_MODEL,
-        storedDefaultModel: options2.getDefaultModel?.(),
-        storedComputerUseModel: options2.getComputerUseModel?.(),
-        storedBrowserUseModel: options2.getBrowserUseModel?.(),
-        experimentModelOverride
-      });
-      const session = createCursorInferencePromptSession({"""
-
-hook = """      const requestedModel = resolveSandRequestedModel({
-        sessionOptions,
-        envModelOverride: process.env.SAND_AGENT_MODEL,
-        storedDefaultModel: options2.getDefaultModel?.(),
-        storedComputerUseModel: options2.getComputerUseModel?.(),
-        storedBrowserUseModel: options2.getBrowserUseModel?.(),
-        experimentModelOverride
-      });
-      const inferenceProvider = (process.env.SAND_INFERENCE_PROVIDER || "xai").toLowerCase();
+HOOK_BODY = """      const inferenceProvider = (process.env.SAND_INFERENCE_PROVIDER || "xai").toLowerCase();
       if (inferenceProvider !== "cursor") {
         try {
           const { createXaiPromptSession } = require("./xai-prompt-session.cjs");
@@ -88,40 +84,81 @@ hook = """      const requestedModel = resolveSandRequestedModel({
           console.error("[sand-xai] failed to create xAI session, falling back to Cursor:", xaiErr);
         }
       }
+"""
+
+# Current host (2026-09): resolveSandRequestedModel -> inferenceOptions -> return createCursor...
+needle_new = """      const requestedModel = resolveSandRequestedModel({
+        sessionOptions,
+        envModelOverride: options2.agentModelOverride,
+        storedDefaultModel: options2.getDefaultModel?.(),
+        storedComputerUseModel: options2.getComputerUseModel?.(),
+        storedBrowserUseModel: options2.getBrowserUseModel?.(),
+        experimentModelOverride
+      });
+      const inferenceOptions = {"""
+
+hook_new = """      const requestedModel = resolveSandRequestedModel({
+        sessionOptions,
+        envModelOverride: options2.agentModelOverride,
+        storedDefaultModel: options2.getDefaultModel?.(),
+        storedComputerUseModel: options2.getComputerUseModel?.(),
+        storedBrowserUseModel: options2.getBrowserUseModel?.(),
+        experimentModelOverride
+      });
+""" + HOOK_BODY + """      const inferenceOptions = {"""
+
+# Older host: resolveSandRequestedModel -> const session = createCursor...( {
+needle_old = """      const requestedModel = resolveSandRequestedModel({
+        sessionOptions,
+        envModelOverride: process.env.SAND_AGENT_MODEL,
+        storedDefaultModel: options2.getDefaultModel?.(),
+        storedComputerUseModel: options2.getComputerUseModel?.(),
+        storedBrowserUseModel: options2.getBrowserUseModel?.(),
+        experimentModelOverride
+      });
       const session = createCursorInferencePromptSession({"""
 
-if needle not in text:
-    # Fallback: insert immediately before the unique createCursorInferencePromptSession call
-    if text.count(anchor_tail) != 1:
-        print("ERROR: could not find unique createCursorSandInference anchor", file=sys.stderr)
-        raise SystemExit(2)
-    text = text.replace(
-        anchor_tail,
-        """      const inferenceProvider = (process.env.SAND_INFERENCE_PROVIDER || "xai").toLowerCase();
-      if (inferenceProvider !== "cursor") {
-        try {
-          const { createXaiPromptSession } = require("./xai-prompt-session.cjs");
-          return createXaiPromptSession({
-            requestedModel,
-            onRequestId,
-            sessionOptions
-          });
-        } catch (xaiErr) {
-          console.error("[sand-xai] failed to create xAI session, falling back to Cursor:", xaiErr);
-        }
-      }
-""" + anchor_tail,
-        1,
-    )
+hook_old = """      const requestedModel = resolveSandRequestedModel({
+        sessionOptions,
+        envModelOverride: process.env.SAND_AGENT_MODEL,
+        storedDefaultModel: options2.getDefaultModel?.(),
+        storedComputerUseModel: options2.getComputerUseModel?.(),
+        storedBrowserUseModel: options2.getBrowserUseModel?.(),
+        experimentModelOverride
+      });
+""" + HOOK_BODY + """      const session = createCursorInferencePromptSession({"""
+
+applied = None
+if needle_new in text:
+    text = text.replace(needle_new, hook_new, 1)
+    applied = "needle_new"
+elif needle_old in text:
+    text = text.replace(needle_old, hook_old, 1)
+    applied = "needle_old"
 else:
-    text = text.replace(needle, hook, 1)
+    candidates = [
+        "      return createCursorInferencePromptSession(inferenceOptions);",
+        "      const session = createCursorInferencePromptSession({",
+    ]
+    for anchor in candidates:
+        if text.count(anchor) == 1:
+            idx = text.find(anchor)
+            window = text[max(0, idx - 1200):idx]
+            if "requestedModel" not in window:
+                continue
+            text = text.replace(anchor, HOOK_BODY + anchor, 1)
+            applied = f"anchor:{anchor.strip()[:48]}"
+            break
+    if applied is None:
+        print("ERROR: could not find createCursorSandInference inject anchor", file=sys.stderr)
+        raise SystemExit(2)
 
 if not backup.exists():
     shutil.copy2(host_main, backup)
     print(f"backed up {backup}")
 
 host_main.write_text(text, encoding="utf-8", errors="surrogateescape")
-print("injected createXaiPromptSession hook")
+print(f"injected createXaiPromptSession hook ({applied})")
 PY
 
 if grep -q createXaiPromptSession "$HOST_MAIN"; then

@@ -10,6 +10,7 @@
  * Reads ~/sand-data/xai-inference.env on every session (file wins over process env).
  */
 
+const crypto = require("crypto");
 const fs = require("fs");
 const http = require("http");
 const https = require("https");
@@ -141,16 +142,237 @@ function asString(value) {
   }
 }
 
+
+function imageMimeForPath(fp) {
+  const ext = String(fp || "").toLowerCase().split(".").pop();
+  if (ext === "png") return "image/png";
+  if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+  if (ext === "webp") return "image/webp";
+  if (ext === "gif") return "image/gif";
+  return "image/png";
+}
+
+function fileUrlToDataUrl(url) {
+  // xAI/CLIProxy reject file:// and bare paths: must be http(s) URL or base64 data URL.
+  const raw = String(url || "");
+  if (!raw || raw.startsWith("data:") || raw.startsWith("http://") || raw.startsWith("https://")) return raw || "";
+  let fp = raw.startsWith("file://") ? raw.slice(7) : raw;
+  const maxBytes = Number(process.env.SAND_XAI_MAX_IMAGE_BYTES || 8 * 1024 * 1024);
+  try {
+    const st = fs.statSync(fp);
+    if (!st.isFile() || st.size <= 0 || st.size > maxBytes) return "";
+    const b64 = fs.readFileSync(fp).toString("base64");
+    return `data:${imageMimeForPath(fp)};base64,${b64}`;
+  } catch {
+    return "";
+  }
+}
+
+function normalizeImageUrl(url) {
+  const raw = String(url || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("data:image/") || raw.startsWith("http://") || raw.startsWith("https://")) return raw;
+  return fileUrlToDataUrl(raw);
+}
+
+function attachmentToImageUrl(msg) {
+  // Grok Bot chat stores pics as separate user-attachment entries (file_path),
+  // NOT as image blocks inside message.content. Convert them here.
+  const m = msg || {};
+  const fp = m.file_path ?? m.filePath ?? m.path ?? m.url;
+  if (typeof fp === "string" && fp) return normalizeImageUrl(fp);
+  const atts = m.attachments ?? m.file_attachments ?? m.files;
+  if (Array.isArray(atts)) {
+    for (const a of atts) {
+      const cand = a && (a.file_path ?? a.filePath ?? a.path ?? a.url);
+      if (typeof cand === "string" && cand) {
+        const u = normalizeImageUrl(cand);
+        if (u) return u;
+      }
+    }
+  }
+  return "";
+}
+
+function extractImagePathsFromText(text) {
+  // The app hands chat images to this agent as a plain-text note
+  // ("The user attached a file... materialized on your box at .../attachments/xxx.png")
+  // instead of an image block. Pull absolute image file paths out so they
+  // can be base64'd into real image_url parts.
+  const out = [];
+  if (typeof text !== "string" || !text) return out;
+  if (text.indexOf("attach") === -1 && text.indexOf("/attachments/") === -1 && text.indexOf("/uploads/") === -1) return out;
+  const re = /(\/home\/box\/[A-Za-z0-9_@.\-\/]+\.(?:png|jpe?g|webp|gif))/gi;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const fp = m[1];
+    if (out.indexOf(fp) === -1) out.push(fp);
+    if (out.length >= 5) break;
+  }
+  return out;
+}
+
+function contentToParts(content) {
+  // Split converted content into text parts + image parts so merges keep images.
+  if (content == null) return { texts: [], images: [] };
+  if (typeof content === "string") return { texts: content ? [content] : [], images: [] };
+  if (!Array.isArray(content)) return { texts: [], images: [] };
+  const texts = [];
+  const images = [];
+  for (const part of content) {
+    if (!part) continue;
+    if (typeof part === "string") {
+      if (part) texts.push(part);
+      continue;
+    }
+    const t = part.type;
+    if (t === "image_url") {
+      const u = part.image_url && part.image_url.url ? String(part.image_url.url) : "";
+      if (u) images.push(u);
+      continue;
+    }
+    if (typeof part.text === "string" && part.text) {
+      texts.push(part.text);
+      continue;
+    }
+  }
+  return { texts, images };
+}
+
+function buildUserContent(texts, images) {
+  const t = (texts || []).filter(Boolean);
+  const imgs = (images || []).filter(Boolean);
+  if (!imgs.length) return t.join("\n\n");
+  return [
+    ...t.map((x) => ({ type: "text", text: x })),
+    ...imgs.map((u) => ({ type: "image_url", image_url: { url: u } })),
+  ];
+}
+
 function sanitizeToolId(id) {
   const raw = asString(id) || "tool";
-  const cleaned = raw.replace(/[^a-zA-Z0-9_-]/g, "_");
-  return cleaned || "tool";
+  const cleaned = raw.replace(/[^a-zA-Z0-9_-]/g, "_") || "tool";
+  if (cleaned.length <= 64) return cleaned;
+  // Host prefixes call-<uuid>-<n>_ onto the upstream Codex fc_/call_ id (~85
+  // chars). Prefer the upstream suffix so the assistant tool_call and the
+  // tool result still share an id; hashing each side independently broke pairing
+  // and left bots spinning on orphan tool calls.
+  const m = cleaned.match(/(?:^|_)((?:fc|call)_[A-Za-z0-9_-]{8,})$/);
+  if (m && m[1].length <= 64) return m[1];
+  const digest = crypto.createHash("sha256").update(cleaned).digest("hex").slice(0, 40);
+  return `call_${digest}`;
 }
 
 function sanitizeToolName(name) {
   const raw = asString(name) || "tool";
   const cleaned = raw.replace(/[^a-zA-Z0-9_-]/g, "_");
   return cleaned || "tool";
+}
+
+function isPlaceholderValue(v) {
+  if (v == null) return true;
+  if (typeof v === "boolean") return false;
+  if (typeof v === "number") return false;
+  if (typeof v === "string") {
+    const s = v.trim();
+    return !s || /^(placeholder|x|n\/?a|none|null|undefined|dummy)$/i.test(s) || s.startsWith("dummy") || /^https?:\/\/example\.com/i.test(s);
+  }
+  if (Array.isArray(v)) return v.length === 0 || v.every(isPlaceholderValue);
+  if (typeof v === "object") {
+    const vals = Object.values(v);
+    return vals.length === 0 || vals.every(isPlaceholderValue);
+  }
+  return false;
+}
+
+function normalizeSendToUserArgs(name, args, streamText) {
+  if (name !== "SendToUser" && name !== "send_message") return args || {};
+  if (!args || typeof args !== "object" || Array.isArray(args)) args = {};
+  const out = { ...args };
+  let body =
+    asString(out.content) ||
+    asString(out.message) ||
+    asString(out.text) ||
+    asString(out.body);
+  if (!body && streamText && asString(streamText).trim()) {
+    body = asString(streamText).trim();
+  }
+  if (body) {
+    if (!asString(out.content)) out.content = body;
+    if (!asString(out.message)) out.message = body;
+    if (!asString(out.text)) out.text = body;
+  }
+  if (!asString(out.type)) out.type = "text";
+  // Preserve omitted end_turn: progress updates must not end the host turn.
+  // Explicit values are left unchanged for the host to validate.
+
+  for (const key of ["url", "images", "alt", "reply_to", "channel", "widget", "bcId", "secret"]) {
+    if (isPlaceholderValue(out[key])) delete out[key];
+  }
+  const kind = asString(out.type) || "text";
+  if (kind === "text") {
+    delete out.widget;
+    delete out.secret;
+    delete out.url;
+    delete out.alt;
+    delete out.bcId;
+    if (!Array.isArray(out.images) || out.images.length === 0) {
+      delete out.images;
+    } else {
+      out.images = out.images.filter(img => img && typeof img === "object" && typeof img.url === "string" && !isPlaceholderValue(img.url));
+      if (out.images.length === 0) delete out.images;
+    }
+    if (!asString(out.content)) {
+      out.content = body || " ";
+      out.message = out.content;
+      out.text = out.content;
+    }
+  } else if (kind === "attachment") {
+    delete out.content;
+    delete out.bcId;
+    delete out.widget;
+    delete out.secret;
+    delete out.images;
+  } else if (kind === "cursor-agent") {
+    delete out.url;
+    delete out.alt;
+    delete out.content;
+    delete out.widget;
+    delete out.secret;
+    delete out.images;
+  } else if (kind === "widget") {
+    delete out.url;
+    delete out.alt;
+    delete out.bcId;
+    delete out.secret;
+    delete out.images;
+  } else if (kind === "secret-request") {
+    delete out.url;
+    delete out.alt;
+    delete out.bcId;
+    delete out.widget;
+    delete out.images;
+  }
+
+  if (out.to && out.channel) {
+    delete out.to;
+  }
+  if (out.to && out.to !== "dm") {
+    delete out.to;
+  }
+  if (out.channel && isPlaceholderValue(out.channel)) {
+    delete out.channel;
+  }
+
+  return out;
+}
+
+function toolsIncludeSendToUser(tools) {
+  if (!Array.isArray(tools)) return false;
+  return tools.some((tool) => {
+    const t = unwrapRedacted(tool) || {};
+    return sanitizeToolName(t.name) === "SendToUser";
+  });
 }
 
 function isPlainObject(v) {
@@ -189,15 +411,67 @@ function requestedModelId(requestedModel) {
   return asString(id);
 }
 
+function configuredModelId() {
+  return env("SAND_XAI_MODEL", env("SAND_AGENT_MODEL", "grok-4.6"));
+}
+
 function mapModelId(requestedModel) {
-  const configured = env("SAND_XAI_MODEL", "grok-4.5");
+  const configured = configuredModelId();
   const raw = requestedModelId(requestedModel);
   if (!raw) return configured;
   const lower = raw.toLowerCase();
   if (HOST_INTERNAL_MODELS.has(lower)) return configured;
   if (lower.startsWith("sand-") || lower.startsWith("cursor-")) return configured;
   if (lower.includes("high-fast") || lower.includes("summar")) return configured;
+  // Grok Bot UI / host default still advertise grok-4.5; honor the adapters model.
+  if (lower === "grok-4.5" || lower.startsWith("cursor-grok-4.5") || lower === "vega" || lower.startsWith("vega-")) {
+    return configured;
+  }
   return raw;
+}
+
+function identityDisplayName(modelId) {
+  const id = String(modelId || configuredModelId());
+  const m = id.match(/grok-(\d+(?:\.\d+)?)/i);
+  if (m) return `Grok ${m[1]}`;
+  return id;
+}
+
+function rewriteIdentityText(text, modelId) {
+  if (typeof text !== "string" || !text) return text;
+  const name = identityDisplayName(modelId);
+  const id = configuredModelId();
+  return text
+    .replace(/You are Grok 4\.5/g, `You are ${name}`)
+    .replace(/I am Grok 4\.5/g, `I am ${name}`)
+    .replace(/I'm Grok 4\.5/g, `I'm ${name}`)
+    .replace(/Grok 4\.5/g, name)
+    .replace(/grok-4\.5/g, id);
+}
+
+function applyIdentity(messages, modelId) {
+  if (!truthy(env("SAND_XAI_IDENTITY", "1"))) return messages;
+  const name = identityDisplayName(modelId);
+  const id = modelId || configuredModelId();
+  const line =
+    `You are ${name} (model id ${id}). If asked what model you are, answer ${name}. ` +
+    `Do not say you are Grok 4.5.`;
+  const out = (Array.isArray(messages) ? messages : []).map((m) => {
+    if (!m || m.role !== "system") return m;
+    if (typeof m.content === "string") {
+      return { ...m, content: rewriteIdentityText(m.content, id) };
+    }
+    return m;
+  });
+  const sys = out.find((m) => m && m.role === "system" && typeof m.content === "string");
+  if (sys) {
+    if (!sys.content.startsWith(`You are ${name}`)) {
+      sys.content = `${line}\n\n${sys.content}`;
+    }
+  } else {
+    out.unshift({ role: "system", content: line });
+  }
+  return out;
 }
 
 function grokSessionToken() {
@@ -317,7 +591,18 @@ function convertContentPart(part) {
   }
   if (type === "image" || type === "image_url" || type === "input_image") {
     const url = p.image_url?.url ?? p.url ?? p.image;
-    if (url) return { kind: "image", url: asString(url) };
+    const norm = normalizeImageUrl(asString(url));
+    if (norm) return { kind: "image", url: norm };
+  }
+  if (type === "attachment" || type === "file" || type === "user-attachment") {
+    const u = attachmentToImageUrl(p);
+    if (u) return { kind: "image", url: u };
+    const t = asString(p.text ?? p.file_name ?? p.fileName ?? "");
+    if (t) return { kind: "text", text: t };
+  }
+  if (typeof p.file_path === "string" || typeof p.filePath === "string") {
+    const u = attachmentToImageUrl(p);
+    if (u) return { kind: "image", url: u };
   }
   if (p.text) return { kind: "text", text: asString(p.text) };
   return null;
@@ -325,15 +610,55 @@ function convertContentPart(part) {
 
 function convertMessage(rawMsg) {
   const msg = unwrapRedacted(rawMsg) || {};
-  const role = asString(msg.role || "user");
+  let role = asString(msg.role || "user");
   const out = [];
+  // Chat stores pics as kind/user-attachment entries outside message.content.
+  if (msg.kind === "user-attachment" || role === "user-attachment" || role === "attachment") {
+    const u = attachmentToImageUrl(msg);
+    if (u) {
+      out.push({ role: "user", content: [{ type: "image_url", image_url: { url: u } }] });
+      return out;
+    }
+    const fallback = asString(msg.file_name ?? msg.fileName ?? "");
+    out.push({ role: "user", content: fallback ? `[attached image: ${fallback}]` : "(empty)" });
+    return out;
+  }
 
   if (role === "tool") {
-    const id = sanitizeToolId(msg.tool_call_id ?? msg.toolCallId ?? msg.id);
+    // The id may live on the message OR inside its content parts. Reading only
+    // the top level made every array-shaped tool result collapse to the literal
+    // id "tool", so results matched no call and strict providers (Codex/Claude)
+    // rejected the request while Grok silently tolerated it.
+    let rawId = msg.tool_call_id ?? msg.toolCallId ?? msg.id;
+    const partsList = Array.isArray(msg.content) ? msg.content : [];
+    if (rawId == null || rawId === "") {
+      for (const part of partsList) {
+        const p = unwrapRedacted(part) || {};
+        const cand = p.toolCallId ?? p.tool_call_id ?? p.id;
+        if (cand != null && cand !== "") { rawId = cand; break; }
+      }
+    }
+    // Content: prefer real result payloads from the parts when present.
+    let body = msg.content ?? msg.result ?? "";
+    if (partsList.length) {
+      const chunks = [];
+      for (const part of partsList) {
+        const p = unwrapRedacted(part) || {};
+        const val = p.result ?? p.content ?? p.output ?? p.value ?? p.text;
+        if (val != null && val !== "") {
+          chunks.push(typeof val === "string" ? val : asString(val));
+        }
+      }
+      if (chunks.length) body = chunks.join("\n");
+    }
+    if (rawId == null || rawId === "") {
+      console.error("[sand-xai] tool result has no id; dropping to avoid a phantom pair");
+      return out;
+    }
     out.push({
       role: "tool",
-      tool_call_id: id,
-      content: asString(msg.content ?? msg.result ?? ""),
+      tool_call_id: sanitizeToolId(rawId),
+      content: asString(body),
     });
     return out;
   }
@@ -347,14 +672,26 @@ function convertMessage(rawMsg) {
   const pushContent = (content) => {
     if (content == null) return;
     if (typeof content === "string") {
-      if (content) texts.push(content);
+      if (content) {
+        texts.push(content);
+        for (const fp of extractImagePathsFromText(content)) {
+          const u = normalizeImageUrl(fp);
+          if (u && !images.some((x) => x.url === u)) images.push({ kind: "image", url: u });
+        }
+      }
       return;
     }
     if (Array.isArray(content)) {
       for (const part of content) {
         const c = convertContentPart(part);
         if (!c) continue;
-        if (c.kind === "text" && c.text) texts.push(c.text);
+        if (c.kind === "text" && c.text) {
+          texts.push(c.text);
+          for (const fp of extractImagePathsFromText(c.text)) {
+            const u = normalizeImageUrl(fp);
+            if (u && !images.some((x) => x.url === u)) images.push({ kind: "image", url: u });
+          }
+        }
         else if (c.kind === "reasoning" && c.text && promoteReasoning) texts.push(c.text);
         else if (c.kind === "tool-call") toolCalls.push(c);
         else if (c.kind === "tool-result") toolResults.push(c);
@@ -367,9 +704,17 @@ function convertMessage(rawMsg) {
   };
 
   pushContent(msg.content);
+  // file_path / attachments carried alongside the message (not inside content).
+  if (!msg.content || typeof msg.content === "string") {
+    const u = attachmentToImageUrl(msg);
+    if (u && !images.includes(u)) images.push(u);
+  }
   if (Array.isArray(msg.toolCalls) || Array.isArray(msg.tool_calls)) {
     for (const tc of msg.toolCalls || msg.tool_calls) {
-      const c = convertContentPart({ type: "tool-call", ...unwrapRedacted(tc) });
+      // NOTE: spread FIRST. An OpenAI-style tool call carries type:"function",
+      // which used to override the "tool-call" tag and make convertContentPart
+      // return null — silently dropping every assistant tool call.
+      const c = convertContentPart({ ...unwrapRedacted(tc), type: "tool-call" });
       if (c && c.kind === "tool-call") toolCalls.push(c);
     }
   }
@@ -387,7 +732,7 @@ function convertMessage(rawMsg) {
     if (images.length && (role === "user" || role === "system")) {
       openai.content = [
         ...texts.map((t) => ({ type: "text", text: t })),
-        ...images.map((img) => ({ type: "image_url", image_url: { url: img.url } })),
+        ...images.map((img) => ({ type: "image_url", image_url: { url: normalizeImageUrl(img.url) } })).filter((x) => x.image_url.url),
       ];
     } else {
       openai.content = texts.join("\n") || (toolCalls.length ? "" : "");
@@ -442,6 +787,7 @@ function messageChars(msg) {
       if (!p) continue;
       if (typeof p === "string") n += p.length;
       else if (typeof p.text === "string") n += p.text.length;
+      else if (p.type === "image_url") n += 1500;
       else n += JSON.stringify(p).length;
     }
   }
@@ -456,7 +802,8 @@ function clipText(s, max) {
 }
 
 function clipMessageContent(msg, max) {
-  if (!msg || typeof msg.content !== "string" || msg.content.length <= max) return msg;
+  if (!msg || Array.isArray(msg.content)) return msg;
+  if (typeof msg.content !== "string" || msg.content.length <= max) return msg;
   return { ...msg, content: clipText(msg.content, max) };
 }
 
@@ -471,15 +818,15 @@ function mergeConsecutiveRoles(msgs) {
     if (Array.isArray(m.tool_calls)) m.tool_calls = m.tool_calls.map((t) => ({ ...t }));
     const last = out[out.length - 1];
     if (m.role === "user" && last && last.role === "user") {
-      const a = typeof last.content === "string" ? last.content : "";
-      const b = typeof m.content === "string" ? m.content : "";
-      last.content = [a, b].filter(Boolean).join("\n\n");
+      const a = contentToParts(last.content);
+      const b = contentToParts(m.content);
+      last.content = buildUserContent([...a.texts, ...b.texts], [...a.images, ...b.images]);
       continue;
     }
     if (m.role === "assistant" && last && last.role === "assistant") {
-      const texts = [];
-      if (typeof last.content === "string" && last.content) texts.push(last.content);
-      if (typeof m.content === "string" && m.content) texts.push(m.content);
+      const a = contentToParts(last.content);
+      const b = contentToParts(m.content);
+      const texts = [...a.texts, ...b.texts];
       if (texts.length) last.content = texts.join("\n");
       if (m.tool_calls && m.tool_calls.length) {
         last.tool_calls = [...(last.tool_calls || []), ...m.tool_calls];
@@ -493,6 +840,64 @@ function mergeConsecutiveRoles(msgs) {
 
 // Gemini: a function-call turn must follow a user or function-response turn.
 // Never start (after system) with assistant/tool, and never leave orphan tool rows.
+// Strict providers (Codex/OpenAI Responses, Claude) 400 the whole request when a
+// tool_call has no matching tool result, or a tool result has no matching call.
+// Interrupted turns ("superseded by a new user message") leave exactly that.
+// Grok tolerates it; these do not. Reconcile by ID before sending.
+function pairToolCallsAndResults(msgs) {
+  const list = Array.isArray(msgs) ? msgs.map((m) => ({ ...m })) : [];
+
+  // Pass 1: collect tool result ids present in the transcript.
+  const resultIds = new Set();
+  for (const m of list) {
+    if (m && m.role === "tool") {
+      const id = m.tool_call_id || m.toolCallId;
+      if (id) resultIds.add(String(id));
+    }
+  }
+
+  // Pass 2: drop assistant tool_calls that never got a result.
+  const keptCallIds = new Set();
+  const out = [];
+  for (const m of list) {
+    if (m && m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      const kept = m.tool_calls.filter((tc) => {
+        const id = tc && (tc.id || tc.tool_call_id);
+        return id && resultIds.has(String(id));
+      });
+      if (kept.length !== m.tool_calls.length) {
+        const orphans = m.tool_calls.length - kept.length;
+        console.error(`[sand-xai] dropped ${orphans} orphan tool_call(s) with no result`);
+      }
+      for (const tc of kept) keptCallIds.add(String(tc.id || tc.tool_call_id));
+      if (kept.length) {
+        m.tool_calls = kept;
+      } else {
+        delete m.tool_calls;
+        const hasText =
+          (typeof m.content === "string" && m.content.trim()) ||
+          (Array.isArray(m.content) && m.content.length);
+        if (!hasText) continue; // nothing left worth sending
+      }
+    }
+    out.push(m);
+  }
+
+  // Pass 3: drop tool results whose call was dropped or never existed.
+  const final = [];
+  for (const m of out) {
+    if (m && m.role === "tool") {
+      const id = m.tool_call_id || m.toolCallId;
+      if (!id || !keptCallIds.has(String(id))) {
+        console.error("[sand-xai] dropped orphan tool result", id || "(no id)");
+        continue;
+      }
+    }
+    final.push(m);
+  }
+  return final;
+}
+
 function normalizeToolTurns(msgs) {
   let list = mergeConsecutiveRoles(msgs);
   const out = [];
@@ -589,7 +994,8 @@ function trimConvertedMessages(messages, model) {
     }
   }
 
-  const normalized = normalizeToolTurns(list);
+  const paired = pairToolCallsAndResults(list);
+  const normalized = normalizeToolTurns(paired);
   const after = normalized.reduce((n, m) => n + messageChars(m), 0);
   if (after !== before || dropped || normalized.length !== beforeCount) {
     console.error(
@@ -609,9 +1015,40 @@ function convertTools(tools) {
         name: sanitizeToolName(t.name),
         description: clipText(asString(t.description || t.name || ""), 800),
         parameters: normalizeToolParameters(t.parameters ?? t.inputSchema ?? t.schema),
+        // Host schemas allow omission. Responses-backed proxies otherwise inherit
+        // strict defaults that make optional fields (e.g. machineId) mandatory.
+        strict: false,
       },
     };
   });
+}
+
+function debugImageProbe(stage, messages) {
+  try {
+    const rows = [];
+    const list = Array.isArray(messages) ? messages : [];
+    for (let i = 0; i < list.length; i++) {
+      const m = list[i] || {};
+      const c = m.content;
+      let hasImg = false, note = '';
+      if (Array.isArray(c)) {
+        for (const part of c) {
+          if (!part || typeof part !== 'object') continue;
+          const t = part.type || part.kind || '';
+          if (t === 'image' || t === 'image_url' || t === 'input_image') { hasImg = true; break; }
+          if (typeof part.text === 'string' && (part.text.indexOf('/attachments/') !== -1 || part.text.indexOf('/uploads/') !== -1)) {
+            const mm = part.text.match(/\/home\/box\/[A-Za-z0-9_@.\-\/]+\.(?:png|jpe?g|webp|gif)/gi) || [];
+            note = 'text-paths:' + mm.length;
+          }
+        }
+      } else if (typeof c === 'string' && (c.indexOf('/attachments/') !== -1 || c.indexOf('/uploads/') !== -1)) {
+        const mm = c.match(/\/home\/box\/[A-Za-z0-9_@.\-\/]+\.(?:png|jpe?g|webp|gif)/gi) || [];
+        note = 'str-paths:' + mm.length;
+      }
+      if (hasImg || note) rows.push(`${stage}[${i}] role=${m.role} img=${hasImg} ${note}`);
+    }
+    if (rows.length) fs.appendFileSync(DEBUG_LOG + '.images', new Date().toISOString() + ' ' + rows.join(' | ') + '\n');
+  } catch { /* ignore */ }
 }
 
 function debugDump(raw, converted) {
@@ -766,7 +1203,13 @@ function errorResult(modelId, invocationId, err) {
 }
 
 async function runStream({ model, messages, tools, invocationId, auth }) {
-  const converted = trimConvertedMessages(convertMessages(messages), model);
+  debugImageProbe('raw-in', messages);
+  const stepConvert = convertMessages(messages);
+  debugImageProbe('after-convert', stepConvert);
+  const stepTrim = trimConvertedMessages(stepConvert, model);
+  debugImageProbe('after-trim', stepTrim);
+  const converted = applyIdentity(stepTrim, model);
+  debugImageProbe('after-identity', converted);
   debugDump(messages, converted);
   const openaiTools = convertTools(tools);
 
@@ -836,7 +1279,7 @@ async function runStream({ model, messages, tools, invocationId, auth }) {
           reasoning += think;
           push({ type: "reasoning", textDelta: think });
         }
-        const tcs = delta.tool_calls;
+        const tcs = delta.tool_calls || (choice.message && choice.message.tool_calls);
         if (Array.isArray(tcs)) {
           for (const tc of tcs) {
             const idx = tc.index != null ? tc.index : toolAcc.size;
@@ -847,26 +1290,8 @@ async function runStream({ model, messages, tools, invocationId, auth }) {
             }
             if (tc.id) acc.id = sanitizeToolId(tc.id);
             const fn = tc.function || {};
-            if (fn.name) {
-              acc.name = sanitizeToolName(fn.name);
-              if (!acc.started) {
-                acc.started = true;
-                push({
-                  type: "tool-call-streaming-start",
-                  toolCallId: acc.id || `call_${idx}`,
-                  toolName: acc.name,
-                });
-              }
-            }
-            if (fn.arguments) {
-              acc.args += fn.arguments;
-              push({
-                type: "tool-call-delta",
-                toolCallId: acc.id || `call_${idx}`,
-                toolName: acc.name || "tool",
-                argsTextDelta: fn.arguments,
-              });
-            }
+            if (fn.name) acc.name = sanitizeToolName(fn.name);
+            if (typeof fn.arguments === "string" && fn.arguments) acc.args += fn.arguments;
           }
         }
       },
@@ -880,9 +1305,27 @@ async function runStream({ model, messages, tools, invocationId, auth }) {
   for (const acc of toolAcc.values()) {
     const id = acc.id || sanitizeToolId(`call_${toolCalls.length}`);
     const name = acc.name || "tool";
-    const args = parseArgs(acc.args);
+    const args = normalizeSendToUserArgs(name, parseArgs(acc.args), text);
     toolCalls.push({ id, name, args });
+    // One-shot tool-call only. Codex streams argument JSON one token at a time;
+    // replaying those fragments then emitting a re-stringified `tool-call` makes
+    // the host ToolCallStream.complete() splice the two JSON encodings into
+    // invalid args (Claude sends one complete call, so it never hits this).
     push({ type: "tool-call", toolCallId: id, toolName: name, args });
+  }
+
+  // Grok Bot only delivers SendToUser. Promote a plain-text-only reply as a
+  // final message, but never synthesize end_turn alongside pending tool work.
+  if (
+    toolsIncludeSendToUser(tools) &&
+    toolCalls.length === 0 &&
+    asString(text).trim()
+  ) {
+    const id = sanitizeToolId("call_sendtouser_promote");
+    const args = normalizeSendToUserArgs("SendToUser", { message: asString(text).trim(), end_turn: true });
+    toolCalls.unshift({ id, name: "SendToUser", args });
+    push({ type: "tool-call", toolCallId: id, toolName: "SendToUser", args });
+    finishReason = "tool_calls";
   }
 
   const usage = normalizeUsage(usageRaw);
@@ -891,6 +1334,23 @@ async function runStream({ model, messages, tools, invocationId, auth }) {
     messages: buildResponseMessages(text, toolCalls),
     finishReason: finishReason === "tool_calls" ? "tool-calls" : finishReason || "stop",
   };
+  const send = toolCalls.find((t) => t.name === "SendToUser");
+  console.error(
+    `[sand-xai] stream finish=${response.finishReason} tools=${toolCalls.map((t) => t.name).join(",") || "-"} text=${text.length}` +
+      (send
+        ? ` sendKeys=${Object.keys(send.args || {}).join(",")} type=${asString(send.args && send.args.type)} contentLen=${asString(send.args && (send.args.content || send.args.message || send.args.text)).length} end_turn=${send.args && send.args.end_turn}`
+        : "")
+  );
+  if (send) {
+    try {
+      fs.appendFileSync(
+        "/tmp/sand-xai-send.log",
+        JSON.stringify({ ts: new Date().toISOString(), args: send.args }) + "\n"
+      );
+    } catch {
+      /* ignore */
+    }
+  }
   push({ type: "finish", finishReason: response.finishReason, usage, response });
 
   return {
