@@ -38,6 +38,49 @@ function baseIdentity(name) {
   return {dir, machine, boot};
 }
 
+function publicationTests() {
+  const dir = path.join(temp, 'publication');
+  const helper = path.join(root, 'scripts/recovery-state.py');
+  const source = path.join(dir, 'source');
+  const target = path.join(dir, 'target');
+  write(source, 'snapshot bytes\n', 0o600);
+  const publish = (from, to) => run('python3', [
+    helper, 'publish', '--source', from, '--target', to, '--mode', '600',
+  ], {env: safeEnv});
+
+  write(target, 'concurrent user bytes\n');
+  ok(publish(source, target), 17);
+  assert.equal(fs.readFileSync(target, 'utf8'), 'concurrent user bytes\n');
+
+  fs.unlinkSync(target);
+  const danglingDestination = path.join(dir, 'dangling-destination');
+  fs.symlinkSync(danglingDestination, target);
+  ok(publish(source, target), 17);
+  assert.equal(fs.lstatSync(target).isSymbolicLink(), true);
+  assert.equal(fs.existsSync(danglingDestination), false);
+
+  const blockedParent = path.join(dir, 'blocked-parent');
+  write(blockedParent, 'not a directory\n');
+  assert.notEqual(publish(source, path.join(blockedParent, 'target')).status, 0);
+
+  fs.unlinkSync(target);
+  const sources = [];
+  for (let index = 0; index < 8; index++) {
+    const candidate = path.join(dir, `source-${index}`);
+    write(candidate, `complete-${index}\n`);
+    sources.push(candidate);
+  }
+  ok(run('bash', ['-c', `
+for source in "$PUB_DIR"/source-*; do
+  python3 "$HELPER" publish --source "$source" --target "$TARGET" &
+done
+wait || true
+`], {env: {...safeEnv, PUB_DIR: dir, HELPER: helper, TARGET: target}}));
+  assert.ok(sources.some(candidate =>
+    fs.readFileSync(candidate, 'utf8') === fs.readFileSync(target, 'utf8')));
+  console.log('PASS: no-replace publication preserves concurrent files and rejects dangling/blocked targets');
+}
+
 function moshiTests() {
   const {dir, machine, boot} = baseIdentity('moshi');
   const home = path.join(dir, 'home');
@@ -46,10 +89,12 @@ function moshiTests() {
   const secrets = path.join(home, '.local/state/moshi/secrets.json');
   const pairings = path.join(home, '.config/moshi/host-pairings.json');
   const hook = path.join(home, '.cursor/hooks.json');
+  const optionalHook = path.join(home, '.codex/hooks.json');
   executable(binary, '[[ "${1:-}" == status ]] && echo "Status: paired"');
   write(secrets, '{"pairing":"synthetic"}\n', 0o600);
   write(pairings, '{"host":"synthetic"}\n', 0o600);
   write(hook, '{"user":"before"}\n');
+  write(optionalHook, '{"moshi":"enabled"}\n');
   const env = {
     ...safeEnv,
     MOSHI_HOME: home,
@@ -59,8 +104,60 @@ function moshiTests() {
     MOSHI_DAEMON_CHECK_CMD: 'exit 0',
   };
   const script = path.join(root, 'scripts/ensure-moshi.sh');
-  const call = mode => run('bash', [script, mode], {env});
+  const call = (mode, extra = {}) => run('bash', [script, mode],
+    {env: {...env, ...extra}});
 
+  ok(call('prepare-reset'));
+  const lockResult = run('bash', ['-c', `
+(
+  exec 8>"$MOSHI_PERSIST/.recovery.lock"
+  flock -x 8
+  : > "$LOCK_READY"
+  sleep 1
+) &
+holder=$!
+while [[ ! -f "$LOCK_READY" ]]; do sleep 0.01; done
+RECOVERY_LOCK_TIMEOUT=0 bash "$MOSHI_SCRIPT" snapshot
+rc=$?
+wait "$holder"
+exit "$rc"
+`], {env: {...env, LOCK_READY: path.join(dir, 'lock-ready'), MOSHI_SCRIPT: script}});
+  assert.notEqual(lockResult.status, 0, 'component mutation must respect the recovery lock');
+  const helperLog = path.join(dir, 'helper-calls');
+  const failingStateHelper = path.join(dir, 'failing-state-helper');
+  executable(failingStateHelper, `
+echo "$1" >> "$HELPER_CALLS"
+[[ "$1" == "\${FAIL_HELPER_COMMAND:-}" ]] && exit 23
+exec python3 "${path.join(root, 'scripts/recovery-state.py')}" "$@"`);
+  let failed = call('snapshot', {
+    RECOVERY_STATE_HELPER: failingStateHelper,
+    FAIL_HELPER_COMMAND: 'create',
+    HELPER_CALLS: helperLog,
+  });
+  assert.notEqual(failed.status, 0);
+  assert.doesNotMatch(failed.stdout, /validated Moshi snapshot/);
+  fs.rmSync(helperLog);
+  failed = call('prepare-reset', {
+    RECOVERY_STATE_HELPER: failingStateHelper,
+    FAIL_HELPER_COMMAND: 'invalidate-provenance',
+    HELPER_CALLS: helperLog,
+  });
+  assert.notEqual(failed.status, 0);
+  assert.deepEqual(fs.readFileSync(helperLog, 'utf8').trim().split('\n'),
+    ['invalidate-provenance']);
+  assert.equal(fs.existsSync(path.join(persist, 'reset-provenance.json')), true,
+    'failed invalidation must stop before replacing old authority');
+  fs.rmSync(helperLog);
+  failed = call('prepare-reset', {
+    RECOVERY_STATE_HELPER: failingStateHelper,
+    FAIL_HELPER_COMMAND: 'prepare',
+    HELPER_CALLS: helperLog,
+  });
+  assert.notEqual(failed.status, 0);
+  assert.equal(fs.existsSync(path.join(persist, 'reset-provenance.json')), false);
+  assert.doesNotMatch(failed.stdout, /recorded Moshi reset provenance/);
+  assert.deepEqual(fs.readFileSync(helperLog, 'utf8').trim().split('\n'),
+    ['invalidate-provenance', 'create', 'prepare']);
   ok(call('prepare-reset'));
   const current = fs.readlinkSync(path.join(persist, 'current'));
   const releaseDir = fs.realpathSync(path.join(persist, 'current'));
@@ -105,10 +202,29 @@ function moshiTests() {
   fs.unlinkSync(binary);
   fs.unlinkSync(secrets);
   fs.unlinkSync(pairings);
+  fs.unlinkSync(optionalHook);
   write(hook, '{"user":"changed-after-snapshot"}\n');
-  ok(call('recover'), 10);
+  assert.notEqual(call('recover').status, 0);
+  assert.equal(fs.existsSync(secrets), false,
+    'sensitive Moshi deletion must require explicit approval before mutation');
+  const failingHelper = path.join(dir, 'fail-optional-helper');
+  executable(failingHelper, `
+if [[ "\${1:-}" == publish && " $* " == *".codex/hooks.json"* ]]; then
+  printf '{"user":"concurrent"}\\n' > "${optionalHook}"
+fi
+exec python3 "${path.join(root, 'scripts/recovery-state.py')}" "$@"`);
+  assert.notEqual(call('recover', {
+    GROK_APPROVE_SENSITIVE_RESTORE: '1',
+    RECOVERY_STATE_HELPER: failingHelper,
+  }).status, 0);
+  assert.equal(fs.existsSync(binary), false);
+  assert.equal(fs.existsSync(secrets), false,
+    'optional hook publication failure must roll back earlier Moshi files');
+  assert.equal(fs.readFileSync(optionalHook, 'utf8'), '{"user":"concurrent"}\n');
+  ok(call('recover', {GROK_APPROVE_SENSITIVE_RESTORE: '1'}), 10);
   assert.equal(fs.readFileSync(hook, 'utf8'), '{"user":"changed-after-snapshot"}\n');
   assert.equal(fs.readFileSync(secrets, 'utf8'), '{"pairing":"synthetic"}\n');
+  assert.equal(fs.readFileSync(optionalHook, 'utf8'), '{"user":"concurrent"}\n');
   assert.equal(fs.existsSync(path.join(persist, 'reset-provenance.json')), false);
   ok(call('recover'));
 
@@ -195,6 +311,22 @@ function tailscaleTests() {
   assert.notEqual(call('monitor', {MOCK_SSH_PORT: '2222'}).status, 0);
   assert.notEqual(call('monitor', {MOCK_LISTENER: 'other'}).status, 0);
   ok(call('prepare-reset'));
+  const failHelper = path.join(fixture.dir, 'failing-state-helper');
+  executable(failHelper, `
+[[ "\${1:-}" == "\${FAIL_HELPER_COMMAND:-}" ]] && exit 29
+exec python3 "${path.join(root, 'scripts/recovery-state.py')}" "$@"`);
+  assert.notEqual(call('prepare-reset', {
+    RECOVERY_STATE_HELPER: failHelper,
+    FAIL_HELPER_COMMAND: 'create',
+  }).status, 0);
+  assert.equal(fs.existsSync(path.join(fixture.persist, 'reset-provenance.json')), false);
+  ok(call('prepare-reset'));
+  assert.notEqual(call('prepare-reset', {
+    RECOVERY_STATE_HELPER: failHelper,
+    FAIL_HELPER_COMMAND: 'prepare',
+  }).status, 0);
+  assert.equal(fs.existsSync(path.join(fixture.persist, 'reset-provenance.json')), false);
+  ok(call('prepare-reset'));
 
   // A deliberate key removal remains authoritative on routine healthy runs.
   write(fixture.auth, '', 0o600);
@@ -225,10 +357,13 @@ function tailscaleTests() {
   fs.unlinkSync(path.join(fixture.sshDir, 'ssh_host_ed25519_key'));
   fs.unlinkSync(path.join(fixture.sshDir, 'ssh_host_ed25519_key.pub'));
   write(fixture.boot, 'boot-d\n');
-  assert.notEqual(call('recover', {RECOVERY_SYSTEM_OWNER: 'no-such-user:no-such-group'}).status, 0);
+  assert.notEqual(call('recover', {
+    GROK_APPROVE_SENSITIVE_RESTORE: '1',
+    RECOVERY_SYSTEM_OWNER: 'no-such-user:no-such-group',
+  }).status, 0);
   assert.equal(fs.existsSync(fixture.state), false,
     'failed privileged ownership must remove the partial restore');
-  ok(call('recover'), 10);
+  ok(call('recover', {GROK_APPROVE_SENSITIVE_RESTORE: '1'}), 10);
   assert.match(fs.readFileSync(fixture.config, 'utf8'), /changed by user/);
   assert.match(fs.readFileSync(fixture.auth, 'utf8'), /replacement/);
   ok(call('recover'));
@@ -242,15 +377,18 @@ function tailscaleTests() {
   write(path.join(fixture.sshDir, 'ssh_host_rsa_key.pub'), 'replacement public\n');
   fs.unlinkSync(fixture.state);
   write(fixture.boot, 'boot-f\n');
-  assert.notEqual(call('recover').status, 0);
+  assert.notEqual(call('recover', {GROK_APPROVE_SENSITIVE_RESTORE: '1'}).status, 0);
+  assert.equal(fs.existsSync(fixture.state), false,
+    'host-key ambiguity must be detected before restoring other SSH/VPN files');
   assert.equal(fs.existsSync(path.join(fixture.sshDir, 'ssh_host_ed25519_key')), false);
   assert.equal(fs.existsSync(path.join(fixture.sshDir, 'ssh_host_rsa_key')), true);
 
   // A partial host-key set is not silently completed from a historical set.
+  write(fixture.state, 'synthetic tailscale state\n', 0o600);
   ok(call('prepare-reset'));
   fs.unlinkSync(path.join(fixture.sshDir, 'ssh_host_rsa_key.pub'));
   write(fixture.boot, 'boot-g\n');
-  const partial = call('recover');
+  const partial = call('recover', {GROK_APPROVE_SENSITIVE_RESTORE: '1'});
   assert.notEqual(partial.status, 0);
   assert.equal(fs.existsSync(path.join(fixture.sshDir, 'ssh_host_rsa_key.pub')), false);
   console.log('PASS: SSH keys/config preserve user intent; RunSSH=false is verified; partial state fails');
@@ -260,17 +398,35 @@ function wiringTests() {
   const dir = path.join(temp, 'wiring');
   const scripts = path.join(dir, 'scripts');
   const calls = path.join(dir, 'calls');
+  const moshiMarker = path.join(dir, 'moshi-authority');
+  const tsMarker = path.join(dir, 'ts-authority');
   fs.mkdirSync(scripts, {recursive: true});
   executable(path.join(scripts, 'ensure-moshi.sh'),
-    'echo "moshi:$1" >> "$MOCK_CALLS"; exit "${MOSHI_RC:-0}"');
+    `echo "moshi:$1" >> "$MOCK_CALLS"
+key="MOSHI_\${1//-/_}_RC"
+rc="\${!key:-\${MOSHI_RC:-0}}"
+if [[ "$rc" == 0 ]]; then
+  [[ "$1" == invalidate-reset ]] && rm -f "$MOSHI_MARKER"
+  [[ "$1" == arm-reset ]] && : > "$MOSHI_MARKER"
+fi
+exit "$rc"`);
   executable(path.join(scripts, 'ensure-tailscale-ssh.sh'),
-    'echo "tailscale:$1" >> "$MOCK_CALLS"; exit "${TS_RC:-0}"');
+    `echo "tailscale:$1" >> "$MOCK_CALLS"
+key="TS_\${1//-/_}_RC"
+rc="\${!key:-\${TS_RC:-0}}"
+if [[ "$rc" == 0 ]]; then
+  [[ "$1" == invalidate-reset ]] && rm -f "$TS_MARKER"
+  [[ "$1" == arm-reset ]] && : > "$TS_MARKER"
+fi
+exit "$rc"`);
   const env = {
     ...safeEnv,
     HOME: path.join(dir, 'orchestrator-home'),
     GROK_RECOVERY_SCRIPT_DIR: scripts,
     GROK_RECOVERY_FORCE_COMPONENTS: '1',
     MOCK_CALLS: calls,
+    MOSHI_MARKER: moshiMarker,
+    TS_MARKER: tsMarker,
   };
   const orchestrator = path.join(root, 'scripts/recover-host-services.sh');
   ok(run('bash', [orchestrator, 'recover'], {env: {...env, MOSHI_RC: '10'}}), 10);
@@ -278,6 +434,64 @@ function wiringTests() {
     ['moshi:recover', 'tailscale:recover']);
   fs.rmSync(calls);
   ok(run('bash', [orchestrator, 'recover'], {env: {...env, TS_RC: '7'}}), 7);
+
+  const prepBase = {
+    ...env,
+    GROK_RECOVERY_SOURCE_DIR: path.join(root, 'scripts'),
+    GROK_BOT_PERSIST_ROOT: path.join(dir, 'prepare-persist'),
+  };
+  const prep = extra => run('bash', [orchestrator, 'prepare-reset'],
+    {env: {...prepBase, ...extra}});
+  const readCalls = () => fs.readFileSync(calls, 'utf8').trim().split('\n');
+
+  fs.rmSync(calls);
+  write(moshiMarker, 'old\n');
+  write(tsMarker, 'old\n');
+  assert.notEqual(prep({MOSHI_invalidate_reset_RC: '7'}).status, 0);
+  assert.deepEqual(readCalls(), ['moshi:invalidate-reset', 'tailscale:invalidate-reset']);
+  assert.equal(fs.existsSync(moshiMarker), true);
+  assert.equal(fs.existsSync(tsMarker), false,
+    'later components must still invalidate after an earlier invalidation failure');
+
+  fs.rmSync(calls);
+  fs.rmSync(moshiMarker, {force: true});
+  assert.notEqual(prep({TS_snapshot_RC: '8'}).status, 0);
+  assert.deepEqual(readCalls(), [
+    'moshi:invalidate-reset', 'tailscale:invalidate-reset',
+    'moshi:snapshot', 'tailscale:snapshot',
+  ]);
+  assert.equal(fs.existsSync(moshiMarker), false);
+  assert.equal(fs.existsSync(tsMarker), false);
+
+  fs.rmSync(calls);
+  assert.notEqual(prep({TS_arm_reset_RC: '9'}).status, 0);
+  assert.deepEqual(readCalls(), [
+    'moshi:invalidate-reset', 'tailscale:invalidate-reset',
+    'moshi:snapshot', 'tailscale:snapshot',
+    'moshi:arm-reset', 'tailscale:arm-reset',
+    'moshi:invalidate-reset', 'tailscale:invalidate-reset',
+  ]);
+  assert.equal(fs.existsSync(moshiMarker), false);
+  assert.equal(fs.existsSync(tsMarker), false,
+    'partial marker publication must be rolled back for every component');
+
+  const badSource = path.join(dir, 'bad-runtime-source');
+  fs.mkdirSync(badSource, {recursive: true});
+  for (const file of [
+    'recover-host-services.sh', 'ensure-moshi.sh', 'ensure-tailscale-ssh.sh',
+    'restore-after-reset.sh',
+  ]) {
+    fs.copyFileSync(path.join(root, 'scripts', file), path.join(badSource, file));
+  }
+  write(path.join(badSource, 'recovery-state.py'), 'raise SystemExit(19)\n');
+  fs.rmSync(calls);
+  assert.notEqual(prep({GROK_RECOVERY_SOURCE_DIR: badSource}).status, 0);
+  assert.deepEqual(readCalls(), [
+    'moshi:invalidate-reset', 'tailscale:invalidate-reset',
+    'moshi:snapshot', 'tailscale:snapshot',
+  ]);
+  assert.equal(fs.existsSync(moshiMarker), false);
+  assert.equal(fs.existsSync(tsMarker), false);
 
   const adaptersCalls = path.join(dir, 'adapter-calls');
   executable(path.join(dir, 'host-recovery.sh'),
@@ -389,6 +603,7 @@ function wiringTests() {
 }
 
 try {
+  publicationTests();
   moshiTests();
   tailscaleTests();
   wiringTests();

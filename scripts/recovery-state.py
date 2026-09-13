@@ -8,6 +8,8 @@ import hashlib
 import json
 import os
 import pathlib
+import pwd
+import grp
 import shutil
 import sys
 import tempfile
@@ -249,13 +251,83 @@ def cmd_consume(args: argparse.Namespace) -> None:
     print(consumed)
 
 
+def cmd_invalidate(args: argparse.Namespace) -> None:
+    path = pathlib.Path(args.persist).resolve() / "reset-provenance.json"
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        fail(f"cannot invalidate reset provenance at {path}: {exc}")
+    if os.path.lexists(path):
+        fail(f"reset provenance still exists after invalidation: {path}")
+
+
+def owner_ids(value: str) -> tuple[int, int]:
+    user, separator, group = value.partition(":")
+    if not separator or not user or not group:
+        fail(f"owner must be user:group: {value}")
+    try:
+        uid = int(user) if user.isdigit() else pwd.getpwnam(user).pw_uid
+        gid = int(group) if group.isdigit() else grp.getgrnam(group).gr_gid
+    except (KeyError, ValueError) as exc:
+        fail(f"unknown owner {value}: {exc}")
+    return uid, gid
+
+
+def cmd_publish(args: argparse.Namespace) -> None:
+    source = pathlib.Path(args.source)
+    target = pathlib.Path(args.target)
+    if source.is_symlink() or not source.is_file():
+        fail(f"publish source is not a regular file: {source}")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        fail(f"cannot create publish parent {target.parent}: {exc}")
+
+    mode = int(args.mode, 8) if args.mode else source.stat().st_mode & 0o777
+    owner = owner_ids(args.owner) if args.owner else None
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    created = False
+    try:
+        descriptor = os.open(target, flags, mode)
+        created = True
+        with os.fdopen(descriptor, "wb") as output, source.open("rb") as input_file:
+            shutil.copyfileobj(input_file, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(target, mode)
+        if owner:
+            os.chown(target, *owner)
+    except FileExistsError:
+        print(f"PRESERVED: target already exists: {target}", file=sys.stderr)
+        raise SystemExit(17)
+    except OSError as exc:
+        if created:
+            try:
+                target.unlink()
+            except OSError:
+                pass
+        fail(f"cannot publish {target}: {exc}")
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser()
     subparsers = result.add_subparsers(dest="command", required=True)
-    for command in ("create", "verify", "prepare", "verify-provenance", "consume"):
+    for command in (
+        "create",
+        "verify",
+        "prepare",
+        "verify-provenance",
+        "consume",
+        "invalidate-provenance",
+        "publish",
+    ):
         sub = subparsers.add_parser(command)
-        sub.add_argument("--component", required=True)
-        sub.add_argument("--persist", required=True)
+        if command != "publish":
+            sub.add_argument("--persist", required=True)
+        if command not in ("invalidate-provenance", "publish"):
+            sub.add_argument("--component", required=True)
         if command == "create":
             sub.add_argument("--file", action="append", default=[])
         if command in ("prepare", "verify-provenance", "consume"):
@@ -264,6 +336,11 @@ def parser() -> argparse.ArgumentParser:
         if command in ("verify-provenance", "consume"):
             sub.add_argument("--provenance")
             sub.add_argument("--max-age", type=int, default=24 * 60 * 60)
+        if command == "publish":
+            sub.add_argument("--source", required=True)
+            sub.add_argument("--target", required=True)
+            sub.add_argument("--mode")
+            sub.add_argument("--owner")
     return result
 
 
@@ -275,6 +352,8 @@ def main() -> None:
         "prepare": cmd_prepare,
         "verify-provenance": cmd_verify_provenance,
         "consume": cmd_consume,
+        "invalidate-provenance": cmd_invalidate,
+        "publish": cmd_publish,
     }[args.command](args)
 
 

@@ -3218,6 +3218,8 @@ SCRIPTABLE
   adapters patch-host                 # re-inject host hook after a host upgrade
   adapters recover                    # after a reset: guarded host services + inference recovery
   adapters host-recovery MODE          # monitor|snapshot|prepare-reset|recover (no host restart)
+  GROK_APPROVE_SENSITIVE_RESTORE=1 adapters host-recovery recover
+                                       # one-shot, after confirming reset-caused deletions
   adapters management                 # print Management Center URL + key
 
   adapters use grok-session --model grok-4.6 --effort high

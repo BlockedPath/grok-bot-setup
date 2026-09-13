@@ -6,10 +6,11 @@ MODE="${1:-recover}"
 SCRIPT_DIR="${GROK_RECOVERY_SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 SOURCE_DIR="${GROK_RECOVERY_SOURCE_DIR:-$SCRIPT_DIR}"
 HOME_DIR="${RECOVERY_HOME:-$HOME}"
+LOCK_TIMEOUT="${RECOVERY_LOCK_TIMEOUT:-30}"
 RESTORED=0
 
 run_component() {
-  local name="$1" script="$2" enabled="$3" rc
+  local name="$1" script="$2" enabled="$3" mode="${4:-$MODE}" rc
   if [[ "$enabled" != "1" ]]; then
     printf '+ SKIP: %s is not installed or enrolled for recovery\n' "$name"
     return 0
@@ -18,7 +19,7 @@ run_component() {
     printf 'ERROR: enabled %s recovery script is missing: %s\n' "$name" "$script" >&2
     return 1
   }
-  "$script" "$MODE"
+  "$script" "$mode"
   rc=$?
   case "$rc" in
     0) return 0 ;;
@@ -64,8 +65,66 @@ preserve_runtime() {
     args+=("--file" "scripts/$file=$SOURCE_DIR/$file")
   done
   python3 "$helper" create --component host-recovery-runtime \
-    --persist "$runtime" "${args[@]}" >/dev/null
+    --persist "$runtime" "${args[@]}" >/dev/null || {
+      printf 'ERROR: recovery runtime snapshot creation failed\n' >&2
+      return 1
+    }
   printf '+ validated recovery runtime snapshot: %s/current\n' "$runtime"
+}
+
+invalidate_all() {
+  local failed=0
+  run_component Moshi "$SCRIPT_DIR/ensure-moshi.sh" "$moshi_enabled" invalidate-reset || failed=1
+  run_component Tailscale/OpenSSH "$SCRIPT_DIR/ensure-tailscale-ssh.sh" "$ts_enabled" invalidate-reset || failed=1
+  [[ "$failed" -eq 0 ]]
+}
+
+prepare_all() {
+  # First revoke every old authority, even if an earlier revocation fails.
+  invalidate_all || {
+    printf 'ERROR: not all old reset authorities could be invalidated; preparation stopped\n' >&2
+    return 1
+  }
+  run_component Moshi "$SCRIPT_DIR/ensure-moshi.sh" "$moshi_enabled" snapshot || return
+  run_component Tailscale/OpenSSH "$SCRIPT_DIR/ensure-tailscale-ssh.sh" "$ts_enabled" snapshot || return
+  preserve_runtime || return
+
+  # Arm only after every snapshot/runtime is valid. Roll back all authority if
+  # any marker write fails, and report rollback failure explicitly.
+  run_component Moshi "$SCRIPT_DIR/ensure-moshi.sh" "$moshi_enabled" arm-reset || {
+    invalidate_all || printf 'ERROR: failed to roll back reset authorities\n' >&2
+    return 1
+  }
+  run_component Tailscale/OpenSSH "$SCRIPT_DIR/ensure-tailscale-ssh.sh" "$ts_enabled" arm-reset || {
+    invalidate_all || printf 'ERROR: failed to roll back reset authorities\n' >&2
+    return 1
+  }
+  printf '+ all enabled host recovery snapshots prepared atomically\n'
+}
+
+run_requested() {
+  if [[ "$MODE" == "prepare-reset" ]]; then
+    prepare_all
+  else
+    run_component Moshi "$SCRIPT_DIR/ensure-moshi.sh" "$moshi_enabled" || return
+    run_component Tailscale/OpenSSH "$SCRIPT_DIR/ensure-tailscale-ssh.sh" "$ts_enabled"
+  fi
+}
+
+with_global_lock() {
+  local persist_root="${GROK_BOT_PERSIST_ROOT:-$HOME_DIR/.local/share/grok-bot-persist}"
+  local rc
+  mkdir -p "$persist_root" || return 1
+  exec 8>"$persist_root/.host-recovery.lock" || return 1
+  flock -w "$LOCK_TIMEOUT" 8 || {
+    printf 'ERROR: timed out waiting for host recovery lock\n' >&2
+    return 1
+  }
+  run_requested
+  rc=$?
+  flock -u 8 || true
+  exec 8>&-
+  return "$rc"
 }
 
 MOSHI_PERSIST_PATH="${MOSHI_PERSIST:-$HOME_DIR/.local/share/grok-bot-persist/moshi}"
@@ -75,11 +134,10 @@ ts_enabled=0
 component_enabled "$MOSHI_PERSIST_PATH" "${MOSHI_BIN:-$HOME_DIR/.local/bin/moshi-hook}" && moshi_enabled=1
 component_enabled "$TS_PERSIST_PATH" "${TAILSCALE_BIN:-/usr/bin/tailscale}" && ts_enabled=1
 
-run_component Moshi "$SCRIPT_DIR/ensure-moshi.sh" "$moshi_enabled" || exit $?
-run_component Tailscale/OpenSSH "$SCRIPT_DIR/ensure-tailscale-ssh.sh" "$ts_enabled" || exit $?
-if [[ "$MODE" == "prepare-reset" ]]; then
-  preserve_runtime || exit $?
-fi
+case "$MODE" in
+  monitor|check) run_requested || exit $? ;;
+  *) with_global_lock || exit $? ;;
+esac
 
 [[ "$RESTORED" -eq 1 ]] && exit 10
 exit 0

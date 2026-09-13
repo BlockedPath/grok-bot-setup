@@ -11,6 +11,8 @@ STATE_HELPER="${RECOVERY_STATE_HELPER:-$SCRIPT_DIR/recovery-state.py}"
 MACHINE_ID_FILE="${RECOVERY_MACHINE_ID_FILE:-/etc/machine-id}"
 BOOT_ID_FILE="${RECOVERY_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
 MAX_AGE="${RECOVERY_PROVENANCE_MAX_AGE:-86400}"
+LOCK_TIMEOUT="${RECOVERY_LOCK_TIMEOUT:-30}"
+APPROVE_SENSITIVE="${GROK_APPROVE_SENSITIVE_RESTORE:-0}"
 
 BIN="${MOSHI_BIN:-$HOME_DIR/.local/bin/moshi-hook}"
 CONFIG_DIR="${MOSHI_CONFIG_DIR:-$HOME_DIR/.config/moshi}"
@@ -18,9 +20,22 @@ STATE_DIR="${MOSHI_STATE_DIR:-$HOME_DIR/.local/state/moshi}"
 SECRETS="$STATE_DIR/secrets.json"
 PAIRINGS="$CONFIG_DIR/host-pairings.json"
 RESTORED=0
+CREATED_TARGETS=()
 
 log() { printf '+ %s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
+
+with_lock() {
+  local rc
+  mkdir -p "$PERSIST" || { fail "cannot create Moshi persist directory"; return 1; }
+  exec 9>"$PERSIST/.recovery.lock" || { fail "cannot open Moshi recovery lock"; return 1; }
+  flock -w "$LOCK_TIMEOUT" 9 || { fail "timed out waiting for Moshi recovery lock"; return 1; }
+  "$@"
+  rc=$?
+  flock -u 9 || true
+  exec 9>&-
+  return "$rc"
+}
 
 json_file_ok() {
   [[ -s "$1" ]] &&
@@ -91,18 +106,34 @@ create_snapshot() {
   }
   snapshot_args
   python3 "$STATE_HELPER" create \
-    --component moshi --persist "$PERSIST" "${SNAPSHOT_FILES[@]}" >/dev/null
+    --component moshi --persist "$PERSIST" "${SNAPSHOT_FILES[@]}" >/dev/null || {
+      fail "Moshi snapshot creation failed"
+      return 1
+    }
   log "validated Moshi snapshot"
 }
 
-prepare_reset() {
-  # A failed new preparation must not leave an older reset authorization active.
-  rm -f "$PERSIST/reset-provenance.json"
-  create_snapshot || return
+invalidate_reset() {
+  python3 "$STATE_HELPER" invalidate-provenance --persist "$PERSIST" || {
+    fail "could not invalidate Moshi reset authority"
+    return 1
+  }
+}
+
+arm_reset() {
   python3 "$STATE_HELPER" prepare \
     --component moshi --persist "$PERSIST" \
-    --machine-id-file "$MACHINE_ID_FILE" --boot-id-file "$BOOT_ID_FILE" >/dev/null
+    --machine-id-file "$MACHINE_ID_FILE" --boot-id-file "$BOOT_ID_FILE" >/dev/null || {
+      fail "could not record Moshi reset authority"
+      return 1
+    }
   log "recorded Moshi reset provenance"
+}
+
+prepare_reset() {
+  invalidate_reset || return
+  create_snapshot || return
+  arm_reset
 }
 
 release_for_recovery() {
@@ -112,24 +143,38 @@ release_for_recovery() {
     --max-age "$MAX_AGE"
 }
 
-restore_absent() {
+path_present() {
+  [[ -e "$1" || -L "$1" ]]
+}
+
+preflight_target() {
+  local target="$1" sensitive="$2"
+  if [[ -L "$target" && ! -e "$target" ]]; then
+    fail "dangling symlink is ambiguous; refusing recovery: $target"
+    return 1
+  fi
+  if ! path_present "$target" && [[ "$sensitive" == "1" && "$APPROVE_SENSITIVE" != "1" ]]; then
+    fail "explicit approval required to restore deleted sensitive file: $target"
+    return 1
+  fi
+}
+
+publish_absent() {
   local source="$1" target="$2" mode="${3:-}"
   [[ -f "$source" ]] || {
     fail "validated snapshot is missing $source"
     return 1
   }
-  if [[ -e "$target" ]]; then
-    # Nonempty or invalid live state may be a deliberate user change.
+  if path_present "$target"; then
     return 0
   fi
-  mkdir -p "$(dirname "$target")"
-  cp -p "$source" "$target"
-  if [[ -n "$mode" ]]; then
-    chmod "$mode" "$target" || {
-      rm -f "$target"
-      return 1
-    }
-  fi
+  local args=(publish --source "$source" --target "$target")
+  [[ -n "$mode" ]] && args+=(--mode "$mode")
+  python3 "$STATE_HELPER" "${args[@]}" || {
+    fail "no-replace publication failed for $target"
+    return 1
+  }
+  CREATED_TARGETS+=("$target")
   RESTORED=1
   log "restored missing $target"
 }
@@ -137,13 +182,56 @@ restore_absent() {
 restore_optional_if_absent() {
   local release="$1" logical="$2" target="$3"
   [[ -f "$release/$logical" ]] || return 0
-  [[ -e "$target" ]] && {
+  path_present "$target" && {
     if ! cmp -s "$release/$logical" "$target"; then
       log "preserved user-managed $target"
     fi
     return 0
   }
-  restore_absent "$release/$logical" "$target"
+  publish_absent "$release/$logical" "$target"
+}
+
+rollback_created() {
+  local index target failed=0
+  for ((index=${#CREATED_TARGETS[@]} - 1; index >= 0; index--)); do
+    target="${CREATED_TARGETS[$index]}"
+    rm -f -- "$target" || failed=1
+  done
+  CREATED_TARGETS=()
+  [[ "$failed" -eq 0 ]] || fail "failed to roll back partial Moshi recovery"
+}
+
+preflight_recovery() {
+  local release="$1" file target
+  [[ -f "$release/bin/moshi-hook" &&
+     -f "$release/state/secrets.json" &&
+     -f "$release/config/host-pairings.json" ]] || {
+    fail "validated Moshi snapshot lacks required files"
+    return 1
+  }
+  preflight_target "$BIN" 0 || return
+  preflight_target "$SECRETS" 1 || return
+  preflight_target "$PAIRINGS" 1 || return
+  if [[ -d "$release/config" ]]; then
+    for file in "$release/config"/*; do
+      [[ -f "$file" ]] || continue
+      [[ "$(basename "$file")" == "host-pairings.json" ]] && continue
+      preflight_target "$CONFIG_DIR/$(basename "$file")" 1 || return
+    done
+  fi
+  local hook_targets=(
+    "hooks/cursor-hooks.json=$HOME_DIR/.cursor/hooks.json"
+    "hooks/grok-moshi-hooks.json=$HOME_DIR/.grok/hooks/moshi-hooks.json"
+    "hooks/pi-moshi-hooks.ts=$HOME_DIR/.pi/agent/extensions/moshi-hooks.ts"
+    "hooks/claude-settings.json=$HOME_DIR/.claude/settings.json"
+    "hooks/codex-hooks.json=$HOME_DIR/.codex/hooks.json"
+  )
+  local spec
+  for spec in "${hook_targets[@]}"; do
+    [[ -f "$release/${spec%%=*}" ]] || continue
+    target="${spec#*=}"
+    preflight_target "$target" 1 || return
+  done
 }
 
 start_daemon_if_needed() {
@@ -182,11 +270,13 @@ recover() {
     return 2
   }
 
+  preflight_recovery "$release" || return 2
+
   # Existing files are never replaced. Invalid existing pairing data therefore
   # fails the final check instead of being silently replaced by an old pairing.
-  restore_absent "$release/bin/moshi-hook" "$BIN" 755 || return
-  restore_absent "$release/state/secrets.json" "$SECRETS" 600 || return
-  restore_absent "$release/config/host-pairings.json" "$PAIRINGS" 600 || return
+  publish_absent "$release/bin/moshi-hook" "$BIN" 755 || { rollback_created; return 1; }
+  publish_absent "$release/state/secrets.json" "$SECRETS" 600 || { rollback_created; return 1; }
+  publish_absent "$release/config/host-pairings.json" "$PAIRINGS" 600 || { rollback_created; return 1; }
 
   local file
   if [[ -d "$release/config" ]]; then
@@ -194,14 +284,14 @@ recover() {
       [[ -f "$file" ]] || continue
       [[ "$(basename "$file")" == "host-pairings.json" ]] && continue
       restore_optional_if_absent "$release" "config/$(basename "$file")" \
-        "$CONFIG_DIR/$(basename "$file")" || return
+        "$CONFIG_DIR/$(basename "$file")" || { rollback_created; return 1; }
     done
   fi
-  restore_optional_if_absent "$release" hooks/cursor-hooks.json "$HOME_DIR/.cursor/hooks.json" || return
-  restore_optional_if_absent "$release" hooks/grok-moshi-hooks.json "$HOME_DIR/.grok/hooks/moshi-hooks.json" || return
-  restore_optional_if_absent "$release" hooks/pi-moshi-hooks.ts "$HOME_DIR/.pi/agent/extensions/moshi-hooks.ts" || return
-  restore_optional_if_absent "$release" hooks/claude-settings.json "$HOME_DIR/.claude/settings.json" || return
-  restore_optional_if_absent "$release" hooks/codex-hooks.json "$HOME_DIR/.codex/hooks.json" || return
+  restore_optional_if_absent "$release" hooks/cursor-hooks.json "$HOME_DIR/.cursor/hooks.json" || { rollback_created; return 1; }
+  restore_optional_if_absent "$release" hooks/grok-moshi-hooks.json "$HOME_DIR/.grok/hooks/moshi-hooks.json" || { rollback_created; return 1; }
+  restore_optional_if_absent "$release" hooks/pi-moshi-hooks.ts "$HOME_DIR/.pi/agent/extensions/moshi-hooks.ts" || { rollback_created; return 1; }
+  restore_optional_if_absent "$release" hooks/claude-settings.json "$HOME_DIR/.claude/settings.json" || { rollback_created; return 1; }
+  restore_optional_if_absent "$release" hooks/codex-hooks.json "$HOME_DIR/.codex/hooks.json" || { rollback_created; return 1; }
 
   start_daemon_if_needed || {
     fail "Moshi daemon could not be restored"
@@ -219,11 +309,13 @@ recover() {
 
 case "$MODE" in
   monitor|check) check_health ;;
-  snapshot) create_snapshot ;;
-  prepare-reset) prepare_reset ;;
-  recover) recover ;;
+  snapshot) with_lock create_snapshot ;;
+  invalidate-reset) with_lock invalidate_reset ;;
+  arm-reset) with_lock arm_reset ;;
+  prepare-reset) with_lock prepare_reset ;;
+  recover) with_lock recover ;;
   *)
-    fail "usage: $0 monitor|snapshot|prepare-reset|recover"
+    fail "usage: $0 monitor|snapshot|invalidate-reset|arm-reset|prepare-reset|recover"
     exit 64
     ;;
 esac

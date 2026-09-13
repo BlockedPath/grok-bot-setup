@@ -11,6 +11,8 @@ STATE_HELPER="${RECOVERY_STATE_HELPER:-$SCRIPT_DIR/recovery-state.py}"
 MACHINE_ID_FILE="${RECOVERY_MACHINE_ID_FILE:-/etc/machine-id}"
 BOOT_ID_FILE="${RECOVERY_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
 MAX_AGE="${RECOVERY_PROVENANCE_MAX_AGE:-86400}"
+LOCK_TIMEOUT="${RECOVERY_LOCK_TIMEOUT:-30}"
+APPROVE_SENSITIVE="${GROK_APPROVE_SENSITIVE_RESTORE:-0}"
 
 TS_BIN="${TAILSCALE_BIN:-/usr/bin/tailscale}"
 TAILSCALED_BIN="${TAILSCALED_BIN:-/usr/sbin/tailscaled}"
@@ -22,9 +24,22 @@ SSHD_CONFIG="${SSHD_CONFIG:-$SSH_DIR/sshd_config}"
 AUTHORIZED_KEYS="${AUTHORIZED_KEYS_FILE:-$HOME_DIR/.ssh/authorized_keys}"
 SYSTEM_OWNER="${RECOVERY_SYSTEM_OWNER:-root:root}"
 RESTORED=0
+CREATED_TARGETS=()
 
 log() { printf '+ %s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
+
+with_lock() {
+  local rc
+  mkdir -p "$PERSIST" || { fail "cannot create Tailscale/OpenSSH persist directory"; return 1; }
+  exec 9>"$PERSIST/.recovery.lock" || { fail "cannot open Tailscale/OpenSSH recovery lock"; return 1; }
+  flock -w "$LOCK_TIMEOUT" 9 || { fail "timed out waiting for Tailscale/OpenSSH recovery lock"; return 1; }
+  "$@"
+  rc=$?
+  flock -u 9 || true
+  exec 9>&-
+  return "$rc"
+}
 
 priv() {
   if [[ "${RECOVERY_NO_SUDO:-0}" == "1" ]]; then
@@ -186,18 +201,34 @@ create_snapshot() {
     --component tailscale-openssh --persist "$PERSIST" "${staged_args[@]}" >/dev/null
   rc=$?
   rm -rf "$input_stage"
-  [[ "$rc" -eq 0 ]] || return "$rc"
+  if [[ "$rc" -ne 0 ]]; then
+    fail "Tailscale/OpenSSH snapshot creation failed"
+    return "$rc"
+  fi
   log "validated Tailscale/OpenSSH snapshot"
 }
 
-prepare_reset() {
-  # A failed new preparation must not leave an older reset authorization active.
-  rm -f "$PERSIST/reset-provenance.json"
-  create_snapshot || return
+invalidate_reset() {
+  python3 "$STATE_HELPER" invalidate-provenance --persist "$PERSIST" || {
+    fail "could not invalidate Tailscale/OpenSSH reset authority"
+    return 1
+  }
+}
+
+arm_reset() {
   python3 "$STATE_HELPER" prepare \
     --component tailscale-openssh --persist "$PERSIST" \
-    --machine-id-file "$MACHINE_ID_FILE" --boot-id-file "$BOOT_ID_FILE" >/dev/null
+    --machine-id-file "$MACHINE_ID_FILE" --boot-id-file "$BOOT_ID_FILE" >/dev/null || {
+      fail "could not record Tailscale/OpenSSH reset authority"
+      return 1
+    }
   log "recorded Tailscale/OpenSSH reset provenance"
+}
+
+prepare_reset() {
+  invalidate_reset || return
+  create_snapshot || return
+  arm_reset
 }
 
 release_for_recovery() {
@@ -214,32 +245,42 @@ consume_provenance() {
     --max-age "$MAX_AGE" >/dev/null
 }
 
-restore_absent() {
+path_present() {
+  [[ -e "$1" || -L "$1" ]]
+}
+
+preflight_target() {
+  local target="$1"
+  if [[ -L "$target" && ! -e "$target" ]]; then
+    fail "dangling symlink is ambiguous; refusing recovery: $target"
+    return 1
+  fi
+  if ! path_present "$target" && [[ "$APPROVE_SENSITIVE" != "1" ]]; then
+    fail "explicit approval required to restore deleted sensitive file: $target"
+    return 1
+  fi
+}
+
+publish_absent() {
   local source="$1" target="$2" mode="${3:-}" owner="${4:-}"
   [[ -f "$source" ]] || {
     fail "validated snapshot is missing $source"
     return 1
   }
-  [[ -e "$target" ]] && return 0
-  priv mkdir -p "$(dirname "$target")"
-  priv cp -p "$source" "$target" || return
-  if [[ -n "$mode" ]]; then
-    priv chmod "$mode" "$target" || {
-      priv rm -f "$target"
-      return 1
-    }
-  fi
-  if [[ -n "$owner" ]]; then
-    priv chown "$owner" "$target" || {
-      priv rm -f "$target"
-      return 1
-    }
-  fi
+  path_present "$target" && return 0
+  local args=(publish --source "$source" --target "$target")
+  [[ -n "$mode" ]] && args+=(--mode "$mode")
+  [[ -n "$owner" ]] && args+=(--owner "$owner")
+  priv python3 "$STATE_HELPER" "${args[@]}" || {
+    fail "no-replace publication failed for $target"
+    return 1
+  }
+  CREATED_TARGETS+=("$target")
   RESTORED=1
   log "restored missing $target"
 }
 
-restore_host_keys() {
+validate_host_keys_plan() {
   local release="$1" snapshot_keys=() live_count=0 matched_count=0 file target
   for file in "$release"/ssh/ssh_host_*; do
     [[ -f "$file" ]] || continue
@@ -262,9 +303,47 @@ restore_host_keys() {
   fi
   if [[ "$live_count" -eq 0 ]]; then
     for file in "${snapshot_keys[@]}"; do
-      restore_absent "$file" "$SSH_DIR/$(basename "$file")" "" "$SYSTEM_OWNER" || return
+      preflight_target "$SSH_DIR/$(basename "$file")" || return
     done
   fi
+}
+
+restore_host_keys() {
+  local release="$1" file
+  local live_count=0
+  for file in "$SSH_DIR"/ssh_host_*; do
+    [[ -f "$file" ]] && live_count=$((live_count + 1))
+  done
+  if [[ "$live_count" -eq 0 ]]; then
+    for file in "$release"/ssh/ssh_host_*; do
+      [[ -f "$file" ]] || continue
+      publish_absent "$file" "$SSH_DIR/$(basename "$file")" "" "$SYSTEM_OWNER" || return
+    done
+  fi
+}
+
+rollback_created() {
+  local index target failed=0
+  for ((index=${#CREATED_TARGETS[@]} - 1; index >= 0; index--)); do
+    target="${CREATED_TARGETS[$index]}"
+    priv rm -f -- "$target" || failed=1
+  done
+  CREATED_TARGETS=()
+  [[ "$failed" -eq 0 ]] || fail "failed to roll back partial Tailscale/OpenSSH recovery"
+}
+
+preflight_recovery() {
+  local release="$1"
+  [[ -f "$release/tailscale/tailscaled.state" &&
+     -f "$release/ssh/sshd_config" &&
+     -f "$release/box-ssh/authorized_keys" ]] || {
+    fail "validated Tailscale/OpenSSH snapshot lacks required files"
+    return 1
+  }
+  preflight_target "$STATE_FILE" || return
+  preflight_target "$SSHD_CONFIG" || return
+  preflight_target "$AUTHORIZED_KEYS" || return
+  validate_host_keys_plan "$release"
 }
 
 start_command() {
@@ -292,13 +371,19 @@ recover() {
     return 2
   }
 
+  # Validate the complete file plan before the first mutation. In particular,
+  # host-key ambiguity cannot leave state/config partially restored.
+  preflight_recovery "$release" || return 2
+
   # Restore only absent files. Existing state/config/key files are authoritative,
   # including an empty authorized_keys file representing deliberate revocation.
-  restore_absent "$release/tailscale/tailscaled.state" "$STATE_FILE" 600 "$SYSTEM_OWNER" || return
-  restore_absent "$release/ssh/sshd_config" "$SSHD_CONFIG" "" "$SYSTEM_OWNER" || return
-  restore_host_keys "$release" || return
-  restore_absent "$release/box-ssh/authorized_keys" "$AUTHORIZED_KEYS" 600 \
-    "${RECOVERY_USER:-$(id -un)}" || return
+  publish_absent "$release/tailscale/tailscaled.state" "$STATE_FILE" 600 "$SYSTEM_OWNER" ||
+    { rollback_created; return 1; }
+  publish_absent "$release/ssh/sshd_config" "$SSHD_CONFIG" "" "$SYSTEM_OWNER" ||
+    { rollback_created; return 1; }
+  restore_host_keys "$release" || { rollback_created; return 1; }
+  publish_absent "$release/box-ssh/authorized_keys" "$AUTHORIZED_KEYS" 600 \
+    "${RECOVERY_USER:-$(id -un)}" || { rollback_created; return 1; }
 
   if [[ "$(backend_state || true)" != "Running" ]]; then
     start_command "${TAILSCALED_START_CMD:-sudo systemctl start tailscaled}" tailscaled || {
@@ -343,11 +428,13 @@ recover() {
 
 case "$MODE" in
   monitor|check) check_health ;;
-  snapshot) create_snapshot ;;
-  prepare-reset) prepare_reset ;;
-  recover) recover ;;
+  snapshot) with_lock create_snapshot ;;
+  invalidate-reset) with_lock invalidate_reset ;;
+  arm-reset) with_lock arm_reset ;;
+  prepare-reset) with_lock prepare_reset ;;
+  recover) with_lock recover ;;
   *)
-    fail "usage: $0 monitor|snapshot|prepare-reset|recover"
+    fail "usage: $0 monitor|snapshot|invalidate-reset|arm-reset|prepare-reset|recover"
     exit 64
     ;;
 esac
