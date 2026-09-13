@@ -383,7 +383,7 @@ recover() {
     { rollback_created; return 1; }
   restore_host_keys "$release" || { rollback_created; return 1; }
   publish_absent "$release/box-ssh/authorized_keys" "$AUTHORIZED_KEYS" 600 \
-    "${RECOVERY_USER:-$(id -un)}" || { rollback_created; return 1; }
+    "${RECOVERY_USER_OWNER:-$(id -un):$(id -gn)}" || { rollback_created; return 1; }
 
   if [[ "$(backend_state || true)" != "Running" ]]; then
     start_command "${TAILSCALED_START_CMD:-sudo systemctl start tailscaled}" tailscaled || {
