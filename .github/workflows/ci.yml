@@ -46,7 +46,7 @@ jobs:
           set -euo pipefail
           chmod +x adapters adapters.sh
           ./adapters help | grep -F "Grok Bot adapters CLI" >/dev/null
-          ./adapters.sh help | grep -F "npm" >/dev/null
+          ./adapters.sh help | grep -F "SCRIPTABLE" >/dev/null
           echo "help OK"
 
       - name: Set up Node.js
