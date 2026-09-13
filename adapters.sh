@@ -3216,7 +3216,8 @@ SCRIPTABLE
   adapters sync-claude [--refresh]   # bidirectional Claude OAuth token sync
   adapters restart-host
   adapters patch-host                 # re-inject host hook after a host upgrade
-  adapters recover                    # after a sand reset: hook + CLIProxy + restart
+  adapters recover                    # after a reset: guarded host services + inference recovery
+  adapters host-recovery MODE          # monitor|snapshot|prepare-reset|recover (no host restart)
   adapters management                 # print Management Center URL + key
 
   adapters use grok-session --model grok-4.6 --effort high
@@ -3244,10 +3245,41 @@ Docs: ${ROOT}/docs/GUIDE_CUSTOM_INFERENCE.md
 EOF
 }
 
+# Run optional Moshi and Tailscale/OpenSSH guards. Exit 10 is a successful
+# restoration signal from the standalone guard and is normalized here.
+cmd_host_recovery() {
+  local mode="${1:-monitor}"
+  local script="${GROK_HOST_RECOVERY_SCRIPT:-$ROOT/scripts/recover-host-services.sh}"
+  [[ -x "$script" ]] || {
+    warn "missing host recovery orchestrator: $script"
+    return 1
+  }
+  "$script" "$mode"
+}
+
+recover_host_services_for_reset() {
+  local rc
+  set +e
+  cmd_host_recovery recover
+  rc=$?
+  set -e
+  case "$rc" in
+    0) return 0 ;;
+    10)
+      log "restored Moshi and/or Tailscale/OpenSSH state"
+      return 0
+      ;;
+    *)
+      warn "host service recovery failed with exit $rc"
+      return "$rc"
+      ;;
+  esac
+}
+
 # Rebuild host hook + CLIProxy after a sand-host / sand-data wipe.
 cmd_recover() {
   log "recover custom inference after a sand reset"
-  chmod +x "$ROOT/adapters" "$ROOT/adapters.sh" "$ROOT/scripts/ensure-xai-inference.sh" 2>/dev/null || true
+  chmod +x "$ROOT/adapters" "$ROOT/adapters.sh" "$ROOT/scripts/"*.sh 2>/dev/null || true
   mkdir -p "$HOME/.local/bin"
   cat >"$HOME/.local/bin/adapters" <<EOF
 #!/bin/sh
@@ -3256,10 +3288,16 @@ EOF
   chmod +x "$HOME/.local/bin/adapters"
   log "PATH launcher $HOME/.local/bin/adapters → $ROOT/adapters.sh"
 
+  recover_host_services_for_reset
+  if [[ "${GROK_RECOVERY_COMPONENTS_ONLY:-0}" == "1" ]]; then
+    return 0
+  fi
+
   if [[ ! -d "$SAND_HOST" || ! -f "$SAND_HOST/host-main.cjs" ]]; then
     warn "missing $SAND_HOST/host-main.cjs — wait for Sand to unpack the host, then re-run: adapters recover"
+    return 1
   else
-    ensure_host_inference || warn "host inference patch failed"
+    ensure_host_inference
   fi
 
   if [[ ! -f "$ENV_FILE" && -f "$ROOT/xai-inference.env.example" ]]; then
@@ -3270,10 +3308,10 @@ EOF
   fi
 
   install_cliproxy
-  start_cliproxy || warn "cliproxy start failed — adapters start cliproxy"
+  start_cliproxy
 
   if [[ -f "$ENV_FILE" ]]; then
-    cmd_restart_host || warn "host restart failed"
+    cmd_restart_host
   else
     warn "no $ENV_FILE — point Sand at a provider, e.g.:"
     warn "  adapters use claude --model claude-opus-5 --oauth"
@@ -3286,7 +3324,7 @@ EOF
   echo "  adapters models"
   echo "  adapters model muse-spark-1.2-contributor"
   echo
-  cmd_status || true
+  cmd_status
 }
 
 # ── main ────────────────────────────────────────────────────────────────────
@@ -3318,6 +3356,8 @@ main() {
     model|set-model|use-model) cmd_set_model "$@" ;;
     restart-host|restart) cmd_restart_host ;;
     patch-host|ensure-host|inject-hook) ensure_host_inference ;;
+    host-recovery|recover-host-services) cmd_host_recovery "${1:-monitor}" ;;
+    prepare-host-recovery) cmd_host_recovery prepare-reset ;;
     recover|restore|bootstrap) cmd_recover ;;
     management|mgmt|cliproxy-ui)
       ensure_cliproxy_mgmt_key >/dev/null

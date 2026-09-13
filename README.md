@@ -120,6 +120,7 @@ Or just run **`adapters`** with no args for the interactive menu.
 | `adapters model <id>` | Switch Sand to that model (keeps the current CLIProxy/base) |
 | `adapters patch-host` | Copy `xai-prompt-session.cjs` into `~/sand-host` and inject the createSession hook |
 | `adapters recover` | After a Sand reset: reinstall hook + CLIProxy v7 + restart host |
+| `adapters host-recovery monitor\|snapshot\|prepare-reset\|recover` | Guard Moshi and Tailscale/OpenSSH without restarting the Grok host |
 | `adapters management` | Print CLIProxy Management Center URL + key |
 | `adapters restart-host` | Restart Sand host to pick up config |
 | `adapters help` | Full help |
@@ -218,12 +219,13 @@ curl -fsSL https://raw.githubusercontent.com/BlockedPath/grok-bot-setup/main/scr
 `adapters recover` / `scripts/bootstrap.sh`:
 
 1. Clone or fast-forward `~/grok-bot-setup` to `origin/main`
-2. Put `adapters` on `PATH`
-3. Copy `xai-prompt-session.cjs` and inject the host hook
-4. Seed `~/sand-data/xai-inference.env` from the example if missing
-5. Install CLIProxy **v7+** + Management Center
-6. Ensure Meta + DeepSeek model aliases exist (keys from `MODEL_API_KEY` / `DEEPSEEK_API_KEY` if you exported them)
-7. Restart the host
+2. Validate/recover enrolled Moshi and Tailscale/OpenSSH state, with reset provenance required before restoring missing access data
+3. Put `adapters` on `PATH`
+4. Copy `xai-prompt-session.cjs` and inject the host hook
+5. Seed `~/sand-data/xai-inference.env` from the example if missing
+6. Install CLIProxy **v7+** + Management Center
+7. Ensure Meta + DeepSeek model aliases exist (keys from `MODEL_API_KEY` / `DEEPSEEK_API_KEY` if you exported them)
+8. Restart the host
 
 Then:
 
@@ -265,6 +267,7 @@ Override the local data dir with `ADAPTERS_DATA=/path`.
 ## Docs
 
 - Full runbook: [docs/GUIDE_CUSTOM_INFERENCE.md](docs/GUIDE_CUSTOM_INFERENCE.md)
+- Safe Moshi/Tailscale/OpenSSH recovery: [docs/HOST_SERVICE_RECOVERY.md](docs/HOST_SERVICE_RECOVERY.md)
 - HTML: [docs/GUIDE_CUSTOM_INFERENCE.html](docs/GUIDE_CUSTOM_INFERENCE.html)
 - CLI: `adapters help`
 - Repo: https://github.com/BlockedPath/grok-bot-setup
