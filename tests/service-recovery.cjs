@@ -125,10 +125,13 @@ exit "$rc"
   assert.notEqual(lockResult.status, 0, 'component mutation must respect the recovery lock');
   const helperLog = path.join(dir, 'helper-calls');
   const failingStateHelper = path.join(dir, 'failing-state-helper');
-  executable(failingStateHelper, `
-echo "$1" >> "$HELPER_CALLS"
-[[ "$1" == "\${FAIL_HELPER_COMMAND:-}" ]] && exit 23
-exec python3 "${path.join(root, 'scripts/recovery-state.py')}" "$@"`);
+  write(failingStateHelper, `import os, sys
+with open(os.environ["HELPER_CALLS"], "a", encoding="utf-8") as log:
+    log.write(sys.argv[1] + "\\n")
+if sys.argv[1] == os.environ.get("FAIL_HELPER_COMMAND"):
+    raise SystemExit(23)
+os.execv(sys.executable, [sys.executable, ${JSON.stringify(path.join(root, 'scripts/recovery-state.py'))}, *sys.argv[1:]])
+`);
   let failed = call('snapshot', {
     RECOVERY_STATE_HELPER: failingStateHelper,
     FAIL_HELPER_COMMAND: 'create',
@@ -208,11 +211,13 @@ exec python3 "${path.join(root, 'scripts/recovery-state.py')}" "$@"`);
   assert.equal(fs.existsSync(secrets), false,
     'sensitive Moshi deletion must require explicit approval before mutation');
   const failingHelper = path.join(dir, 'fail-optional-helper');
-  executable(failingHelper, `
-if [[ "\${1:-}" == publish && " $* " == *".codex/hooks.json"* ]]; then
-  printf '{"user":"concurrent"}\\n' > "${optionalHook}"
-fi
-exec python3 "${path.join(root, 'scripts/recovery-state.py')}" "$@"`);
+  write(failingHelper, `import os, sys
+if sys.argv[1] == "publish" and ${JSON.stringify(optionalHook)} in sys.argv:
+    os.makedirs(os.path.dirname(${JSON.stringify(optionalHook)}), exist_ok=True)
+    with open(${JSON.stringify(optionalHook)}, "w", encoding="utf-8") as output:
+        output.write('{"user":"concurrent"}\\n')
+os.execv(sys.executable, [sys.executable, ${JSON.stringify(path.join(root, 'scripts/recovery-state.py'))}, *sys.argv[1:]])
+`);
   assert.notEqual(call('recover', {
     GROK_APPROVE_SENSITIVE_RESTORE: '1',
     RECOVERY_STATE_HELPER: failingHelper,
@@ -312,9 +317,11 @@ function tailscaleTests() {
   assert.notEqual(call('monitor', {MOCK_LISTENER: 'other'}).status, 0);
   ok(call('prepare-reset'));
   const failHelper = path.join(fixture.dir, 'failing-state-helper');
-  executable(failHelper, `
-[[ "\${1:-}" == "\${FAIL_HELPER_COMMAND:-}" ]] && exit 29
-exec python3 "${path.join(root, 'scripts/recovery-state.py')}" "$@"`);
+  write(failHelper, `import os, sys
+if sys.argv[1] == os.environ.get("FAIL_HELPER_COMMAND"):
+    raise SystemExit(29)
+os.execv(sys.executable, [sys.executable, ${JSON.stringify(path.join(root, 'scripts/recovery-state.py'))}, *sys.argv[1:]])
+`);
   assert.notEqual(call('prepare-reset', {
     RECOVERY_STATE_HELPER: failHelper,
     FAIL_HELPER_COMMAND: 'create',
