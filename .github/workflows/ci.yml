@@ -29,6 +29,7 @@ jobs:
           set -euo pipefail
           bash -n adapters.sh
           bash -n adapters
+          bash -n scripts/*.sh
           echo "bash -n OK"
 
       - name: ShellCheck
@@ -37,15 +38,15 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
           # Fail on errors only; warnings are noisy for a large interactive CLI.
-          shellcheck -S error adapters.sh adapters
+          shellcheck -S error adapters.sh adapters scripts/*.sh
           echo "shellcheck OK"
 
       - name: CLI help smoke test
         run: |
           set -euo pipefail
           chmod +x adapters adapters.sh
-          ./adapters help | grep -q "Grok Bot adapters CLI"
-          ./adapters.sh help | grep -q "npm"
+          ./adapters help | grep -F "Grok Bot adapters CLI" >/dev/null
+          ./adapters.sh help | grep -F "SCRIPTABLE" >/dev/null
           echo "help OK"
 
       - name: Set up Node.js
@@ -57,6 +58,7 @@ jobs:
       - name: Validate package.json
         run: |
           set -euo pipefail
+          npm ci --ignore-scripts
           node -e "
             const p = require('./package.json');
             if (p.name !== 'grok-bot-setup') throw new Error('bad name');
@@ -65,6 +67,9 @@ jobs:
             console.log('package', p.name + '@' + p.version);
           "
           npm pack --dry-run
+
+      - name: Isolated regression tests
+        run: npm test
 
       - name: Pack and install smoke test
         run: |
@@ -96,5 +101,6 @@ jobs:
           set -euo pipefail
           bash -n adapters.sh
           bash -n adapters
+          bash -n scripts/*.sh
           chmod +x adapters adapters.sh
-          ./adapters help | grep -q "Grok Bot adapters CLI"
+          ./adapters help | grep -F "Grok Bot adapters CLI" >/dev/null

@@ -8,6 +8,8 @@ import hashlib
 import json
 import os
 import pathlib
+import pwd
+import grp
 import shutil
 import sys
 import tempfile
@@ -87,13 +89,22 @@ def verify_release(release: pathlib.Path, component: str) -> dict:
     files = manifest.get("files")
     if not isinstance(files, dict) or not files:
         fail("snapshot manifest contains no files")
+    actual_files = {
+        str(path.relative_to(release))
+        for path in release.rglob("*")
+        if path.is_file() and path.name != "manifest.json"
+    }
+    if actual_files != set(files):
+        fail("snapshot contents do not exactly match its manifest")
     for logical, metadata in files.items():
         safe_logical(logical)
         target = release / logical
-        if not target.is_file() or not isinstance(metadata, dict):
+        if target.is_symlink() or not target.is_file() or not isinstance(metadata, dict):
             fail(f"snapshot is missing {logical}")
         if metadata.get("sha256") != digest(target):
             fail(f"snapshot checksum mismatch for {logical}")
+        if metadata.get("mode") != target.stat().st_mode & 0o777:
+            fail(f"snapshot mode mismatch for {logical}")
     expected_id = hashlib.sha256(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -184,7 +195,9 @@ def cmd_prepare(args: argparse.Namespace) -> None:
     print(base / "reset-provenance.json")
 
 
-def validated_provenance(args: argparse.Namespace) -> tuple[pathlib.Path, pathlib.Path]:
+def validated_provenance(
+    args: argparse.Namespace,
+) -> tuple[pathlib.Path, pathlib.Path, dict, str]:
     base = pathlib.Path(args.persist).resolve()
     provenance_path = pathlib.Path(
         args.provenance or base / "reset-provenance.json"
@@ -193,44 +206,134 @@ def validated_provenance(args: argparse.Namespace) -> tuple[pathlib.Path, pathli
     if provenance.get("schema") != SCHEMA or provenance.get("component") != args.component:
         fail(f"reset provenance does not describe {args.component}")
     created_at = provenance.get("created_at")
-    if not isinstance(created_at, int) or time.time() - created_at > args.max_age:
+    now = time.time()
+    if (
+        not isinstance(created_at, int)
+        or created_at > now + 300
+        or now - created_at > args.max_age
+    ):
         fail("reset provenance is stale")
     machine_hash = hashlib.sha256(
         read_identity(args.machine_id_file, "machine id").encode()
     ).hexdigest()
     if provenance.get("machine_id_sha256") != machine_hash:
         fail("reset provenance belongs to a different machine")
-    if provenance.get("boot_id") == read_identity(args.boot_id_file, "boot id"):
+    current_boot = read_identity(args.boot_id_file, "boot id")
+    if provenance.get("boot_id") == current_boot:
         fail("reset provenance predates no observed reboot; recovery is ambiguous")
+    claimed_boot = provenance.get("recovery_boot_id")
+    if claimed_boot is not None and claimed_boot != current_boot:
+        fail("reset provenance was already claimed by a different recovery boot")
     release_id = provenance.get("release")
     if not isinstance(release_id, str) or len(release_id) != 64:
         fail("reset provenance has an invalid release id")
     release = base / "releases" / release_id
     verify_release(release, args.component)
-    return provenance_path, release
+    return provenance_path, release, provenance, current_boot
 
 
 def cmd_verify_provenance(args: argparse.Namespace) -> None:
-    _, release = validated_provenance(args)
+    provenance_path, release, provenance, current_boot = validated_provenance(args)
+    if "recovery_boot_id" not in provenance:
+        provenance["recovery_boot_id"] = current_boot
+        atomic_json(provenance_path, provenance)
     print(release)
 
 
 def cmd_consume(args: argparse.Namespace) -> None:
-    provenance, release = validated_provenance(args)
-    consumed = provenance.with_name(
+    provenance_path, release, provenance, current_boot = validated_provenance(args)
+    if provenance.get("recovery_boot_id") != current_boot:
+        fail("reset provenance has not been claimed by this recovery boot")
+    consumed = provenance_path.with_name(
         f"reset-provenance.consumed-{int(time.time())}-{release.name[:12]}.json"
     )
-    os.replace(provenance, consumed)
+    os.replace(provenance_path, consumed)
     print(consumed)
+
+
+def cmd_invalidate(args: argparse.Namespace) -> None:
+    path = pathlib.Path(args.persist).resolve() / "reset-provenance.json"
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        fail(f"cannot invalidate reset provenance at {path}: {exc}")
+    if os.path.lexists(path):
+        fail(f"reset provenance still exists after invalidation: {path}")
+
+
+def owner_ids(value: str) -> tuple[int, int]:
+    user, separator, group = value.partition(":")
+    if not separator or not user or not group:
+        fail(f"owner must be user:group: {value}")
+    try:
+        uid = int(user) if user.isdigit() else pwd.getpwnam(user).pw_uid
+        gid = int(group) if group.isdigit() else grp.getgrnam(group).gr_gid
+    except (KeyError, ValueError) as exc:
+        fail(f"unknown owner {value}: {exc}")
+    return uid, gid
+
+
+def cmd_publish(args: argparse.Namespace) -> None:
+    source = pathlib.Path(args.source)
+    target = pathlib.Path(args.target)
+    if source.is_symlink() or not source.is_file():
+        fail(f"publish source is not a regular file: {source}")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        fail(f"cannot create publish parent {target.parent}: {exc}")
+
+    mode = int(args.mode, 8) if args.mode else source.stat().st_mode & 0o777
+    owner = owner_ids(args.owner) if args.owner else None
+    temporary = None
+    try:
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+        with os.fdopen(descriptor, "wb") as output, source.open("rb") as input_file:
+            shutil.copyfileobj(input_file, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, mode)
+        if owner:
+            os.chown(temporary, *owner)
+        # A hard-link publication is atomic and never replaces an existing
+        # regular file, directory, or symlink. The completed temporary inode is
+        # invisible at the target name until this operation succeeds.
+        os.link(temporary, target, follow_symlinks=False)
+        directory_fd = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except FileExistsError:
+        print(f"PRESERVED: target already exists: {target}", file=sys.stderr)
+        raise SystemExit(17)
+    except OSError as exc:
+        fail(f"cannot publish {target}: {exc}")
+    finally:
+        if temporary:
+            try:
+                pathlib.Path(temporary).unlink()
+            except FileNotFoundError:
+                pass
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser()
     subparsers = result.add_subparsers(dest="command", required=True)
-    for command in ("create", "verify", "prepare", "verify-provenance", "consume"):
+    for command in (
+        "create",
+        "verify",
+        "prepare",
+        "verify-provenance",
+        "consume",
+        "invalidate-provenance",
+        "publish",
+    ):
         sub = subparsers.add_parser(command)
-        sub.add_argument("--component", required=True)
-        sub.add_argument("--persist", required=True)
+        if command != "publish":
+            sub.add_argument("--persist", required=True)
+        if command not in ("invalidate-provenance", "publish"):
+            sub.add_argument("--component", required=True)
         if command == "create":
             sub.add_argument("--file", action="append", default=[])
         if command in ("prepare", "verify-provenance", "consume"):
@@ -238,7 +341,12 @@ def parser() -> argparse.ArgumentParser:
             sub.add_argument("--boot-id-file", required=True)
         if command in ("verify-provenance", "consume"):
             sub.add_argument("--provenance")
-            sub.add_argument("--max-age", type=int, default=7 * 24 * 60 * 60)
+            sub.add_argument("--max-age", type=int, default=24 * 60 * 60)
+        if command == "publish":
+            sub.add_argument("--source", required=True)
+            sub.add_argument("--target", required=True)
+            sub.add_argument("--mode")
+            sub.add_argument("--owner")
     return result
 
 
@@ -250,6 +358,8 @@ def main() -> None:
         "prepare": cmd_prepare,
         "verify-provenance": cmd_verify_provenance,
         "consume": cmd_consume,
+        "invalidate-provenance": cmd_invalidate,
+        "publish": cmd_publish,
     }[args.command](args)
 
 

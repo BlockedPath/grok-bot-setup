@@ -219,7 +219,7 @@ curl -fsSL https://raw.githubusercontent.com/BlockedPath/grok-bot-setup/main/scr
 `adapters recover` / `scripts/bootstrap.sh`:
 
 1. Clone or fast-forward `~/grok-bot-setup` to `origin/main`
-2. Validate/recover enrolled Moshi and Tailscale/OpenSSH state, with reset provenance required before restoring missing access data
+2. Validate enrolled Moshi and Tailscale/OpenSSH state; restoring deleted access data additionally requires prepared reset provenance and one-shot explicit approval
 3. Put `adapters` on `PATH`
 4. Copy `xai-prompt-session.cjs` and inject the host hook
 5. Seed `~/sand-data/xai-inference.env` from the example if missing
