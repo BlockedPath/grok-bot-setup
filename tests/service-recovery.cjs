@@ -276,7 +276,7 @@ os.execv(sys.executable, [sys.executable, ${JSON.stringify(path.join(root, 'scri
   assert.equal(fs.readFileSync(secrets, 'utf8'), '{"pairing":"synthetic"}\n',
     'earlier publications remain complete and are never unsafely deleted');
   assert.equal(fs.readFileSync(optionalHook, 'utf8'), '{"user":"concurrent"}\n');
-  ok(call('recover', {GROK_APPROVE_SENSITIVE_RESTORE: '1'}), 10);
+  ok(call('recover', {GROK_APPROVE_SENSITIVE_RESTORE: '1'}));
   assert.equal(fs.readFileSync(hook, 'utf8'), '{"user":"changed-after-snapshot"}\n');
   assert.equal(fs.readFileSync(secrets, 'utf8'), '{"pairing":"synthetic"}\n');
   assert.equal(fs.readFileSync(optionalHook, 'utf8'), '{"user":"concurrent"}\n');
