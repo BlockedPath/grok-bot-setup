@@ -233,6 +233,7 @@ function wiringTests() {
     'echo "tailscale:$1" >> "$MOCK_CALLS"; exit "${TS_RC:-0}"');
   const env = {
     ...safeEnv,
+    HOME: path.join(dir, 'orchestrator-home'),
     GROK_RECOVERY_SCRIPT_DIR: scripts,
     GROK_RECOVERY_FORCE_COMPONENTS: '1',
     MOCK_CALLS: calls,
