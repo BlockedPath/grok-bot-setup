@@ -87,13 +87,22 @@ def verify_release(release: pathlib.Path, component: str) -> dict:
     files = manifest.get("files")
     if not isinstance(files, dict) or not files:
         fail("snapshot manifest contains no files")
+    actual_files = {
+        str(path.relative_to(release))
+        for path in release.rglob("*")
+        if path.is_file() and path.name != "manifest.json"
+    }
+    if actual_files != set(files):
+        fail("snapshot contents do not exactly match its manifest")
     for logical, metadata in files.items():
         safe_logical(logical)
         target = release / logical
-        if not target.is_file() or not isinstance(metadata, dict):
+        if target.is_symlink() or not target.is_file() or not isinstance(metadata, dict):
             fail(f"snapshot is missing {logical}")
         if metadata.get("sha256") != digest(target):
             fail(f"snapshot checksum mismatch for {logical}")
+        if metadata.get("mode") != target.stat().st_mode & 0o777:
+            fail(f"snapshot mode mismatch for {logical}")
     expected_id = hashlib.sha256(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -184,7 +193,9 @@ def cmd_prepare(args: argparse.Namespace) -> None:
     print(base / "reset-provenance.json")
 
 
-def validated_provenance(args: argparse.Namespace) -> tuple[pathlib.Path, pathlib.Path]:
+def validated_provenance(
+    args: argparse.Namespace,
+) -> tuple[pathlib.Path, pathlib.Path, dict, str]:
     base = pathlib.Path(args.persist).resolve()
     provenance_path = pathlib.Path(
         args.provenance or base / "reset-provenance.json"
@@ -200,27 +211,36 @@ def validated_provenance(args: argparse.Namespace) -> tuple[pathlib.Path, pathli
     ).hexdigest()
     if provenance.get("machine_id_sha256") != machine_hash:
         fail("reset provenance belongs to a different machine")
-    if provenance.get("boot_id") == read_identity(args.boot_id_file, "boot id"):
+    current_boot = read_identity(args.boot_id_file, "boot id")
+    if provenance.get("boot_id") == current_boot:
         fail("reset provenance predates no observed reboot; recovery is ambiguous")
+    claimed_boot = provenance.get("recovery_boot_id")
+    if claimed_boot is not None and claimed_boot != current_boot:
+        fail("reset provenance was already claimed by a different recovery boot")
     release_id = provenance.get("release")
     if not isinstance(release_id, str) or len(release_id) != 64:
         fail("reset provenance has an invalid release id")
     release = base / "releases" / release_id
     verify_release(release, args.component)
-    return provenance_path, release
+    return provenance_path, release, provenance, current_boot
 
 
 def cmd_verify_provenance(args: argparse.Namespace) -> None:
-    _, release = validated_provenance(args)
+    provenance_path, release, provenance, current_boot = validated_provenance(args)
+    if "recovery_boot_id" not in provenance:
+        provenance["recovery_boot_id"] = current_boot
+        atomic_json(provenance_path, provenance)
     print(release)
 
 
 def cmd_consume(args: argparse.Namespace) -> None:
-    provenance, release = validated_provenance(args)
-    consumed = provenance.with_name(
+    provenance_path, release, provenance, current_boot = validated_provenance(args)
+    if provenance.get("recovery_boot_id") != current_boot:
+        fail("reset provenance has not been claimed by this recovery boot")
+    consumed = provenance_path.with_name(
         f"reset-provenance.consumed-{int(time.time())}-{release.name[:12]}.json"
     )
-    os.replace(provenance, consumed)
+    os.replace(provenance_path, consumed)
     print(consumed)
 
 

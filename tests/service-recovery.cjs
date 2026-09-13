@@ -8,6 +8,11 @@ const {spawnSync} = require('child_process');
 
 const root = path.join(__dirname, '..');
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-service-recovery-'));
+const safeEnv = {
+  PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
+  LANG: 'C.UTF-8',
+  LC_ALL: 'C.UTF-8',
+};
 const run = (cmd, args, options = {}) => {
   const result = spawnSync(cmd, args, {encoding: 'utf8', ...options});
   if (result.error) throw result.error;
@@ -46,7 +51,7 @@ function moshiTests() {
   write(pairings, '{"host":"synthetic"}\n', 0o600);
   write(hook, '{"user":"before"}\n');
   const env = {
-    ...process.env,
+    ...safeEnv,
     MOSHI_HOME: home,
     MOSHI_PERSIST: persist,
     RECOVERY_MACHINE_ID_FILE: machine,
@@ -58,11 +63,25 @@ function moshiTests() {
 
   ok(call('prepare-reset'));
   const current = fs.readlinkSync(path.join(persist, 'current'));
+  const releaseDir = fs.realpathSync(path.join(persist, 'current'));
+  const snapBinary = path.join(releaseDir, 'bin/moshi-hook');
+  fs.chmodSync(snapBinary, 0o644);
+  assert.notEqual(run('python3', [path.join(root, 'scripts/recovery-state.py'),
+    'verify', '--component', 'moshi', '--persist', persist], {env: safeEnv}).status, 0);
+  fs.chmodSync(snapBinary, 0o755);
+  write(path.join(releaseDir, 'unmanifested'), 'bad\n');
+  assert.notEqual(run('python3', [path.join(root, 'scripts/recovery-state.py'),
+    'verify', '--component', 'moshi', '--persist', persist], {env: safeEnv}).status, 0);
+  fs.unlinkSync(path.join(releaseDir, 'unmanifested'));
   write(secrets, '{broken json\n');
   assert.notEqual(call('snapshot').status, 0);
   assert.equal(fs.readlinkSync(path.join(persist, 'current')), current,
     'failed snapshot must not replace current');
+  assert.notEqual(call('prepare-reset').status, 0);
+  assert.equal(fs.existsSync(path.join(persist, 'reset-provenance.json')), false,
+    'failed preparation must invalidate older reset provenance');
   write(secrets, '{"pairing":"synthetic"}\n', 0o600);
+  ok(call('prepare-reset'));
 
   write(boot, 'boot-b\n');
   fs.unlinkSync(binary);
@@ -106,15 +125,16 @@ case "\${1:-}" in
   debug) cat "$MOCK_PREFS" ;;
   set)
     [[ "\${MOCK_SET_FAIL:-0}" == 1 ]] && exit 9
+    [[ "\${MOCK_SET_INEFFECTIVE:-0}" == 1 ]] && exit 0
     printf '{"RunSSH":false}\\n' > "$MOCK_PREFS"
     ;;
   *) exit 2 ;;
 esac`);
   executable(tailscaled, 'exit 0');
-  executable(sshd, '[[ "${1:-}" == -T ]] && echo "port 22"');
+  executable(sshd, '[[ "${1:-}" == -T ]] && echo "port ${MOCK_SSH_PORT:-22}"');
   executable(ss, `
 echo 'State Recv-Q Send-Q Local Address:Port Peer Address:Port'
-[[ "$(cat "$MOCK_LISTENING")" == 1 ]] && echo 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*'`);
+[[ "$(cat "$MOCK_LISTENING")" == 1 ]] && echo "LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\\"\${MOCK_LISTENER:-sshd}\\",pid=1,fd=3))"`);
   write(state, 'synthetic tailscale state\n', 0o600);
   write(config, 'Port 22\n# user setting\n');
   write(path.join(sshDir, 'ssh_host_ed25519_key'), 'synthetic private\n', 0o600);
@@ -124,7 +144,7 @@ echo 'State Recv-Q Send-Q Local Address:Port Peer Address:Port'
   write(backend, 'Running\n');
   write(listening, '1\n');
   const env = {
-    ...process.env,
+    ...safeEnv,
     RECOVERY_HOME: home,
     GROK_BOT_TS_SSH_PERSIST: persist,
     RECOVERY_MACHINE_ID_FILE: machine,
@@ -150,6 +170,11 @@ function tailscaleTests() {
   const script = path.join(root, 'scripts/ensure-tailscale-ssh.sh');
   const call = (mode, extra = {}) => run('bash', [script, mode],
     {env: {...fixture.env, ...extra}});
+  write(path.join(fixture.dir, 'backend'), 'Stopped\n');
+  assert.notEqual(call('monitor').status, 0);
+  write(path.join(fixture.dir, 'backend'), 'Running\n');
+  assert.notEqual(call('monitor', {MOCK_SSH_PORT: '2222'}).status, 0);
+  assert.notEqual(call('monitor', {MOCK_LISTENER: 'other'}).status, 0);
   ok(call('prepare-reset'));
 
   // A deliberate key removal remains authoritative on routine healthy runs.
@@ -162,6 +187,11 @@ function tailscaleTests() {
   write(fixture.prefs, '{"RunSSH":true}\n');
   ok(call('recover', {MOCK_SET_FAIL: '1'}), 5);
   assert.equal(fs.existsSync(path.join(fixture.persist, 'reset-provenance.json')), true);
+  write(fixture.boot, 'boot-other\n');
+  assert.notEqual(call('recover').status, 0,
+    'provenance claimed by one recovery boot must fail on later boots');
+  write(fixture.boot, 'boot-b\n');
+  ok(call('recover', {MOCK_SET_INEFFECTIVE: '1'}), 5);
   ok(call('recover'), 10);
   assert.equal(fs.readFileSync(fixture.auth, 'utf8'), '',
     'Tailscale repair must not resurrect removed keys');
@@ -202,7 +232,7 @@ function wiringTests() {
   executable(path.join(scripts, 'ensure-tailscale-ssh.sh'),
     'echo "tailscale:$1" >> "$MOCK_CALLS"; exit "${TS_RC:-0}"');
   const env = {
-    ...process.env,
+    ...safeEnv,
     GROK_RECOVERY_SCRIPT_DIR: scripts,
     GROK_RECOVERY_FORCE_COMPONENTS: '1',
     MOCK_CALLS: calls,
@@ -218,7 +248,7 @@ function wiringTests() {
   executable(path.join(dir, 'host-recovery.sh'),
     'echo "$1" > "$MOCK_ADAPTER_CALLS"; exit "${HOST_RECOVERY_RC:-0}"');
   const adaptersEnv = {
-    ...process.env,
+    ...safeEnv,
     HOME: path.join(dir, 'adapter-home'),
     GROK_HOST_RECOVERY_SCRIPT: path.join(dir, 'host-recovery.sh'),
     GROK_RECOVERY_COMPONENTS_ONLY: '1',
@@ -232,7 +262,7 @@ function wiringTests() {
 
   // The real bootstrap -> adapters recover path reaches both components.
   const gitEnv = {
-    ...process.env,
+    ...safeEnv,
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: '/dev/null',
     GIT_AUTHOR_NAME: 'Recovery Test',
@@ -289,8 +319,37 @@ function wiringTests() {
   const checkout = path.join(dir, 'checkout');
   executable(path.join(checkout, 'adapters.sh'), 'exit 6');
   ok(run('bash', [persistWrapper], {
-    env: {...process.env, HOME: path.join(dir, 'wrapper-home'), GROK_BOT_SETUP_DIR: checkout},
+    env: {...safeEnv, HOME: path.join(dir, 'wrapper-home'), GROK_BOT_SETUP_DIR: checkout},
   }), 6);
+
+  // A checkout-less wrapper executes only a checksummed persisted runtime.
+  const persistRoot = path.join(dir, 'validated-persist');
+  const runtimeEnv = {
+    ...env,
+    RECOVERY_HOME: path.join(dir, 'runtime-home'),
+    GROK_BOT_PERSIST_ROOT: persistRoot,
+    GROK_RECOVERY_SOURCE_DIR: path.join(root, 'scripts'),
+  };
+  ok(run('bash', [orchestrator, 'prepare-reset'], {env: runtimeEnv}));
+  const validatedWrapper = path.join(persistRoot, 'scripts/restore-after-reset.sh');
+  fs.mkdirSync(path.dirname(validatedWrapper), {recursive: true});
+  fs.copyFileSync(path.join(root, 'scripts/restore-after-reset.sh'), validatedWrapper);
+  fs.chmodSync(validatedWrapper, 0o755);
+  const runtimeCalls = path.join(dir, 'runtime-calls');
+  const fallbackEnv = {
+    ...runtimeEnv,
+    MOCK_CALLS: runtimeCalls,
+    GROK_BOT_SETUP_DIR: path.join(dir, 'missing-checkout'),
+    TS_RC: '7',
+  };
+  ok(run('bash', [validatedWrapper], {env: fallbackEnv}), 7);
+  const runtimeCurrent = fs.realpathSync(
+    path.join(persistRoot, 'recovery-runtime/current'));
+  fs.appendFileSync(path.join(runtimeCurrent, 'scripts/recover-host-services.sh'), '\n# corrupt\n');
+  fs.rmSync(runtimeCalls);
+  assert.notEqual(run('bash', [validatedWrapper], {env: fallbackEnv}).status, 0);
+  assert.equal(fs.existsSync(runtimeCalls), false,
+    'corrupt persisted runtime must be rejected before component execution');
   console.log('PASS: orchestrator, adapters recover and persisted wrapper propagate component failures');
 }
 

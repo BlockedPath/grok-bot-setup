@@ -39,7 +39,9 @@ Preparation also records the snapshot release, a machine-id hash, boot ID and
 timestamp. Change or remove any access/configuration state after preparation?
 Run preparation again, or delete that component's
 `reset-provenance.json`. This prevents an older prepared state from being
-mistaken for current intent.
+mistaken for current intent. Starting a new preparation invalidates an older
+marker before validation, so a failed preparation cannot leave stale recovery
+authority active.
 
 Default same-disk locations:
 
@@ -64,7 +66,9 @@ adapters host-recovery recover
 
 Destructive restoration requires provenance from the same machine, a different
 boot ID, a matching checksummed release, and an age of at most seven days.
-Provenance is consumed after a successful health check.
+The first recovery attempt claims the marker for that post-reset boot; retries
+on a later boot are rejected. Provenance is consumed after a successful health
+check.
 
 Recovery restores absent files only. Existing files—even empty
 `authorized_keys`, which can represent deliberate revocation—win over the
@@ -79,7 +83,9 @@ or ineffective setting change is an error.
 
 Exit `0` means healthy/no restoration, `10` means a component restored state,
 and any other nonzero status means recovery is incomplete. Bootstrap and the
-persisted reset wrapper preserve failures instead of masking them.
+persisted reset wrapper preserve failures instead of masking them. Preparation
+also creates a checksummed recovery-runtime snapshot; checkout-less fallback
+verifies that snapshot before executing it.
 
 ## Same-disk limitation
 

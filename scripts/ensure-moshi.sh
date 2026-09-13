@@ -96,6 +96,8 @@ create_snapshot() {
 }
 
 prepare_reset() {
+  # A failed new preparation must not leave an older reset authorization active.
+  rm -f "$PERSIST/reset-provenance.json"
   create_snapshot || return
   python3 "$STATE_HELPER" prepare \
     --component moshi --persist "$PERSIST" \

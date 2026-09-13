@@ -49,10 +49,10 @@ sshd_port() {
 }
 
 port_22_listening() {
-  "$SS_BIN" -tln 2>/dev/null | awk '
+  priv "$SS_BIN" -tlnp 2>/dev/null | awk '
     NR > 1 {
       address=$4
-      if (address ~ /(^|[\]:.])22$/) found=1
+      if (address ~ /(^|[\]:.])22$/ && $0 ~ /sshd/) found=1
     }
     END { exit(found ? 0 : 1) }
   '
@@ -117,6 +117,16 @@ snapshot_args() {
   done
 }
 
+private_key_modes_ok() {
+  local key mode
+  for key in "$SSH_DIR"/ssh_host_*_key; do
+    [[ -f "$key" ]] || continue
+    mode="$(priv stat -c '%a' "$key" 2>/dev/null)" || return 1
+    # Group/other permission digits must both be zero.
+    [[ "$mode" =~ ^[0-7]00$ ]] || return 1
+  done
+}
+
 create_snapshot() {
   check_health || {
     fail "refusing to snapshot unhealthy Tailscale/OpenSSH state"
@@ -139,12 +149,49 @@ create_snapshot() {
     fail "refusing snapshot without OpenSSH host keys"
     return 1
   }
+  private_key_modes_ok || {
+    fail "refusing snapshot with overly permissive OpenSSH private host keys"
+    return 1
+  }
+
+  # Root-owned sources are copied into a private, user-owned staging tree.
+  # The generic snapshot helper never needs elevated privileges and therefore
+  # cannot leave a root-owned current symlink behind.
+  mkdir -p "$PERSIST"
+  local input_stage spec logical source target rc index
+  local staged_args=()
+  input_stage="$(mktemp -d "$PERSIST/.snapshot-input.XXXXXX")" || return
+  chmod 700 "$input_stage"
+  index=1
+  while [[ "$index" -lt "${#SNAPSHOT_FILES[@]}" ]]; do
+    spec="${SNAPSHOT_FILES[$index]}"
+    logical="${spec%%=*}"
+    source="${spec#*=}"
+    target="$input_stage/$logical"
+    mkdir -p "$(dirname "$target")"
+    if ! priv cp -p "$source" "$target"; then
+      rm -rf "$input_stage"
+      fail "could not stage protected recovery source $source"
+      return 1
+    fi
+    priv chown "$(id -u):$(id -g)" "$target" || {
+      rm -rf "$input_stage"
+      return 1
+    }
+    staged_args+=("--file" "$logical=$target")
+    index=$((index + 2))
+  done
   python3 "$STATE_HELPER" create \
-    --component tailscale-openssh --persist "$PERSIST" "${SNAPSHOT_FILES[@]}" >/dev/null
+    --component tailscale-openssh --persist "$PERSIST" "${staged_args[@]}" >/dev/null
+  rc=$?
+  rm -rf "$input_stage"
+  [[ "$rc" -eq 0 ]] || return "$rc"
   log "validated Tailscale/OpenSSH snapshot"
 }
 
 prepare_reset() {
+  # A failed new preparation must not leave an older reset authorization active.
+  rm -f "$PERSIST/reset-provenance.json"
   create_snapshot || return
   python3 "$STATE_HELPER" prepare \
     --component tailscale-openssh --persist "$PERSIST" \
@@ -182,19 +229,24 @@ restore_absent() {
 }
 
 restore_host_keys() {
-  local release="$1" snapshot_keys=() live_count=0 file target
+  local release="$1" snapshot_keys=() live_count=0 matched_count=0 file target
   for file in "$release"/ssh/ssh_host_*; do
     [[ -f "$file" ]] || continue
     snapshot_keys+=("$file")
     target="$SSH_DIR/$(basename "$file")"
-    [[ -e "$target" ]] && live_count=$((live_count + 1))
+    [[ -e "$target" ]] && matched_count=$((matched_count + 1))
   done
   [[ "${#snapshot_keys[@]}" -gt 0 ]] || {
     fail "validated snapshot contains no OpenSSH host keys"
     return 1
   }
-  if [[ "$live_count" -gt 0 && "$live_count" -lt "${#snapshot_keys[@]}" ]]; then
-    fail "partial live OpenSSH host-key set is ambiguous; refusing overwrite"
+  for file in "$SSH_DIR"/ssh_host_*; do
+    [[ -f "$file" ]] && live_count=$((live_count + 1))
+  done
+  if [[ "$live_count" -gt 0 &&
+        ( "$live_count" -ne "${#snapshot_keys[@]}" ||
+          "$matched_count" -ne "${#snapshot_keys[@]}" ) ]]; then
+    fail "partial or replaced live OpenSSH host-key set is ambiguous; refusing overwrite"
     return 1
   fi
   if [[ "$live_count" -eq 0 ]]; then
