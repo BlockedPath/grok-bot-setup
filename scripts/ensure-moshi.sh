@@ -13,6 +13,7 @@ BOOT_ID_FILE="${RECOVERY_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
 MAX_AGE="${RECOVERY_PROVENANCE_MAX_AGE:-86400}"
 LOCK_TIMEOUT="${RECOVERY_LOCK_TIMEOUT:-30}"
 APPROVE_SENSITIVE="${GROK_APPROVE_SENSITIVE_RESTORE:-0}"
+DENY_FILE="${GROK_RECOVERY_DENY_FILE:-$HOME_DIR/.local/share/grok-bot-persist/.recovery-denied}"
 
 BIN="${MOSHI_BIN:-$HOME_DIR/.local/bin/moshi-hook}"
 CONFIG_DIR="${MOSHI_CONFIG_DIR:-$HOME_DIR/.config/moshi}"
@@ -113,6 +114,23 @@ create_snapshot() {
   log "validated Moshi snapshot"
 }
 
+deny_recovery() {
+  local temporary
+  mkdir -p "$(dirname "$DENY_FILE")" || return 1
+  temporary="$(mktemp "$(dirname "$DENY_FILE")/.recovery-denied.XXXXXX")" || return 1
+  if ! printf 'preparation-incomplete\n' >"$temporary" ||
+     ! chmod 600 "$temporary" ||
+     ! mv -f "$temporary" "$DENY_FILE"; then
+    rm -f "$temporary"
+    return 1
+  fi
+}
+
+allow_recovery() {
+  rm -f "$DENY_FILE" || return 1
+  [[ ! -e "$DENY_FILE" && ! -L "$DENY_FILE" ]]
+}
+
 invalidate_reset() {
   python3 "$STATE_HELPER" invalidate-provenance --persist "$PERSIST" || {
     fail "could not invalidate Moshi reset authority"
@@ -131,12 +149,18 @@ arm_reset() {
 }
 
 prepare_reset() {
+  deny_recovery || { fail "could not block recovery before preparation"; return 1; }
   invalidate_reset || return
   create_snapshot || return
-  arm_reset
+  arm_reset || return
+  allow_recovery || { fail "could not clear Moshi recovery deny marker"; return 1; }
 }
 
 release_for_recovery() {
+  if [[ -e "$DENY_FILE" || -L "$DENY_FILE" ]]; then
+    fail "recovery is blocked because reset preparation did not complete"
+    return 1
+  fi
   python3 "$STATE_HELPER" verify-provenance \
     --component moshi --persist "$PERSIST" \
     --machine-id-file "$MACHINE_ID_FILE" --boot-id-file "$BOOT_ID_FILE" \

@@ -285,30 +285,43 @@ def cmd_publish(args: argparse.Namespace) -> None:
 
     mode = int(args.mode, 8) if args.mode else source.stat().st_mode & 0o777
     owner = owner_ids(args.owner) if args.owner else None
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    created = False
+    temporary = None
+    linked = False
     try:
-        descriptor = os.open(target, flags, mode)
-        created = True
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
         with os.fdopen(descriptor, "wb") as output, source.open("rb") as input_file:
             shutil.copyfileobj(input_file, output)
             output.flush()
             os.fsync(output.fileno())
-        os.chmod(target, mode)
+        os.chmod(temporary, mode)
         if owner:
-            os.chown(target, *owner)
+            os.chown(temporary, *owner)
+        # A hard-link publication is atomic and never replaces an existing
+        # regular file, directory, or symlink. The completed temporary inode is
+        # invisible at the target name until this operation succeeds.
+        os.link(temporary, target, follow_symlinks=False)
+        linked = True
+        directory_fd = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except FileExistsError:
         print(f"PRESERVED: target already exists: {target}", file=sys.stderr)
         raise SystemExit(17)
     except OSError as exc:
-        if created:
+        if linked:
             try:
                 target.unlink()
             except OSError:
                 pass
         fail(f"cannot publish {target}: {exc}")
+    finally:
+        if temporary:
+            try:
+                pathlib.Path(temporary).unlink()
+            except FileNotFoundError:
+                pass
 
 
 def parser() -> argparse.ArgumentParser:

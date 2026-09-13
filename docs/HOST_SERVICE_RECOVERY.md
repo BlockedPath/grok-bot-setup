@@ -46,7 +46,10 @@ authority active.
 Preparation is transactional across enabled components: all previous markers
 are invalidated first, all snapshots and the persisted runtime are validated,
 and only then are new markers armed. If any marker write fails, every marker is
-invalidated again. Preparation failure means no reset is authorized.
+invalidated again. A global deny marker is written before preparation and
+removed only after the complete transaction succeeds. If an old component
+marker cannot be deleted, that deny marker blocks it from being used later.
+Preparation failure means no reset is authorized.
 
 Default same-disk locations:
 
@@ -95,7 +98,8 @@ snapshot. Differing shared hooks and SSH configuration are preserved. Partial
 host-key sets, invalid existing pairing state, stale provenance and failed
 post-repair checks stop with a nonzero exit. File publication is lock-protected
 and uses create-if-absent semantics; a concurrent file or dangling symlink is
-never followed or overwritten.
+never followed or overwritten. The completed file is atomically published at
+its final name, so readers cannot observe an empty or partially copied target.
 
 If needed, recovery starts tailscaled/OpenSSH/Moshi through their normal local
 service commands. It never invokes `tailscale up`. If `RunSSH` is true, it only

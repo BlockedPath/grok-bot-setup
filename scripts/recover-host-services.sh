@@ -7,6 +7,9 @@ SCRIPT_DIR="${GROK_RECOVERY_SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" &&
 SOURCE_DIR="${GROK_RECOVERY_SOURCE_DIR:-$SCRIPT_DIR}"
 HOME_DIR="${RECOVERY_HOME:-$HOME}"
 LOCK_TIMEOUT="${RECOVERY_LOCK_TIMEOUT:-30}"
+PERSIST_ROOT="${GROK_BOT_PERSIST_ROOT:-$HOME_DIR/.local/share/grok-bot-persist}"
+DENY_FILE="${GROK_RECOVERY_DENY_FILE:-$PERSIST_ROOT/.recovery-denied}"
+export GROK_RECOVERY_DENY_FILE="$DENY_FILE"
 RESTORED=0
 
 run_component() {
@@ -38,8 +41,7 @@ component_enabled() {
 }
 
 preserve_runtime() {
-  local persist_root="${GROK_BOT_PERSIST_ROOT:-$HOME_DIR/.local/share/grok-bot-persist}"
-  local runtime="$persist_root/recovery-runtime"
+  local runtime="$PERSIST_ROOT/recovery-runtime"
   local helper="$SOURCE_DIR/recovery-state.py"
   local files=(
     recovery-state.py
@@ -72,6 +74,24 @@ preserve_runtime() {
   printf '+ validated recovery runtime snapshot: %s/current\n' "$runtime"
 }
 
+deny_recovery() {
+  local temporary
+  mkdir -p "$(dirname "$DENY_FILE")" || return 1
+  temporary="$(mktemp "$(dirname "$DENY_FILE")/.recovery-denied.XXXXXX")" || return 1
+  if ! printf 'preparation-incomplete\n' >"$temporary" ||
+     ! chmod 600 "$temporary" ||
+     ! mv -f "$temporary" "$DENY_FILE"; then
+    rm -f "$temporary"
+    return 1
+  fi
+  [[ -f "$DENY_FILE" ]]
+}
+
+allow_recovery() {
+  rm -f "$DENY_FILE" || return 1
+  [[ ! -e "$DENY_FILE" && ! -L "$DENY_FILE" ]]
+}
+
 invalidate_all() {
   local failed=0
   run_component Moshi "$SCRIPT_DIR/ensure-moshi.sh" "$moshi_enabled" invalidate-reset || failed=1
@@ -80,6 +100,10 @@ invalidate_all() {
 }
 
 prepare_all() {
+  deny_recovery || {
+    printf 'ERROR: could not block recovery before preparation\n' >&2
+    return 1
+  }
   # First revoke every old authority, even if an earlier revocation fails.
   invalidate_all || {
     printf 'ERROR: not all old reset authorities could be invalidated; preparation stopped\n' >&2
@@ -99,6 +123,10 @@ prepare_all() {
     invalidate_all || printf 'ERROR: failed to roll back reset authorities\n' >&2
     return 1
   }
+  allow_recovery || {
+    printf 'ERROR: reset markers armed but recovery deny marker could not be cleared\n' >&2
+    return 1
+  }
   printf '+ all enabled host recovery snapshots prepared atomically\n'
 }
 
@@ -112,10 +140,9 @@ run_requested() {
 }
 
 with_global_lock() {
-  local persist_root="${GROK_BOT_PERSIST_ROOT:-$HOME_DIR/.local/share/grok-bot-persist}"
   local rc
-  mkdir -p "$persist_root" || return 1
-  exec 8>"$persist_root/.host-recovery.lock" || return 1
+  mkdir -p "$PERSIST_ROOT" || return 1
+  exec 8>"$PERSIST_ROOT/.host-recovery.lock" || return 1
   flock -w "$LOCK_TIMEOUT" 8 || {
     printf 'ERROR: timed out waiting for host recovery lock\n' >&2
     return 1

@@ -13,6 +13,7 @@ BOOT_ID_FILE="${RECOVERY_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
 MAX_AGE="${RECOVERY_PROVENANCE_MAX_AGE:-86400}"
 LOCK_TIMEOUT="${RECOVERY_LOCK_TIMEOUT:-30}"
 APPROVE_SENSITIVE="${GROK_APPROVE_SENSITIVE_RESTORE:-0}"
+DENY_FILE="${GROK_RECOVERY_DENY_FILE:-$HOME_DIR/.local/share/grok-bot-persist/.recovery-denied}"
 
 TS_BIN="${TAILSCALE_BIN:-/usr/bin/tailscale}"
 TAILSCALED_BIN="${TAILSCALED_BIN:-/usr/sbin/tailscaled}"
@@ -25,6 +26,7 @@ AUTHORIZED_KEYS="${AUTHORIZED_KEYS_FILE:-$HOME_DIR/.ssh/authorized_keys}"
 SYSTEM_OWNER="${RECOVERY_SYSTEM_OWNER:-root:root}"
 RESTORED=0
 CREATED_TARGETS=()
+HOST_KEYS_ACTION=keep
 
 log() { printf '+ %s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
@@ -208,6 +210,23 @@ create_snapshot() {
   log "validated Tailscale/OpenSSH snapshot"
 }
 
+deny_recovery() {
+  local temporary
+  mkdir -p "$(dirname "$DENY_FILE")" || return 1
+  temporary="$(mktemp "$(dirname "$DENY_FILE")/.recovery-denied.XXXXXX")" || return 1
+  if ! printf 'preparation-incomplete\n' >"$temporary" ||
+     ! chmod 600 "$temporary" ||
+     ! mv -f "$temporary" "$DENY_FILE"; then
+    rm -f "$temporary"
+    return 1
+  fi
+}
+
+allow_recovery() {
+  rm -f "$DENY_FILE" || return 1
+  [[ ! -e "$DENY_FILE" && ! -L "$DENY_FILE" ]]
+}
+
 invalidate_reset() {
   python3 "$STATE_HELPER" invalidate-provenance --persist "$PERSIST" || {
     fail "could not invalidate Tailscale/OpenSSH reset authority"
@@ -226,12 +245,18 @@ arm_reset() {
 }
 
 prepare_reset() {
+  deny_recovery || { fail "could not block recovery before preparation"; return 1; }
   invalidate_reset || return
   create_snapshot || return
-  arm_reset
+  arm_reset || return
+  allow_recovery || { fail "could not clear Tailscale/OpenSSH recovery deny marker"; return 1; }
 }
 
 release_for_recovery() {
+  if [[ -e "$DENY_FILE" || -L "$DENY_FILE" ]]; then
+    fail "recovery is blocked because reset preparation did not complete"
+    return 1
+  fi
   python3 "$STATE_HELPER" verify-provenance \
     --component tailscale-openssh --persist "$PERSIST" \
     --machine-id-file "$MACHINE_ID_FILE" --boot-id-file "$BOOT_ID_FILE" \
@@ -282,18 +307,30 @@ publish_absent() {
 
 validate_host_keys_plan() {
   local release="$1" snapshot_keys=() live_count=0 matched_count=0 file target
+  HOST_KEYS_ACTION=keep
   for file in "$release"/ssh/ssh_host_*; do
     [[ -f "$file" ]] || continue
     snapshot_keys+=("$file")
     target="$SSH_DIR/$(basename "$file")"
-    [[ -e "$target" ]] && matched_count=$((matched_count + 1))
+    if path_present "$target"; then
+      [[ -f "$target" && ! -L "$target" ]] || {
+        fail "non-regular OpenSSH host-key target is ambiguous: $target"
+        return 1
+      }
+      matched_count=$((matched_count + 1))
+    fi
   done
   [[ "${#snapshot_keys[@]}" -gt 0 ]] || {
     fail "validated snapshot contains no OpenSSH host keys"
     return 1
   }
   for file in "$SSH_DIR"/ssh_host_*; do
-    [[ -f "$file" ]] && live_count=$((live_count + 1))
+    path_present "$file" || continue
+    [[ -f "$file" && ! -L "$file" ]] || {
+      fail "non-regular OpenSSH host-key target is ambiguous: $file"
+      return 1
+    }
+    live_count=$((live_count + 1))
   done
   if [[ "$live_count" -gt 0 &&
         ( "$live_count" -ne "${#snapshot_keys[@]}" ||
@@ -302,6 +339,7 @@ validate_host_keys_plan() {
     return 1
   fi
   if [[ "$live_count" -eq 0 ]]; then
+    HOST_KEYS_ACTION=restore
     for file in "${snapshot_keys[@]}"; do
       preflight_target "$SSH_DIR/$(basename "$file")" || return
     done
@@ -309,17 +347,17 @@ validate_host_keys_plan() {
 }
 
 restore_host_keys() {
-  local release="$1" file
-  local live_count=0
-  for file in "$SSH_DIR"/ssh_host_*; do
-    [[ -f "$file" ]] && live_count=$((live_count + 1))
+  local release="$1" planned="$HOST_KEYS_ACTION" file
+  validate_host_keys_plan "$release" || return
+  [[ "$HOST_KEYS_ACTION" == "$planned" ]] || {
+    fail "OpenSSH host-key state changed during recovery; refusing partial restore"
+    return 1
+  }
+  [[ "$planned" == "restore" ]] || return 0
+  for file in "$release"/ssh/ssh_host_*; do
+    [[ -f "$file" ]] || continue
+    publish_absent "$file" "$SSH_DIR/$(basename "$file")" "" "$SYSTEM_OWNER" || return
   done
-  if [[ "$live_count" -eq 0 ]]; then
-    for file in "$release"/ssh/ssh_host_*; do
-      [[ -f "$file" ]] || continue
-      publish_absent "$file" "$SSH_DIR/$(basename "$file")" "" "$SYSTEM_OWNER" || return
-    done
-  fi
 }
 
 rollback_created() {
@@ -377,11 +415,11 @@ recover() {
 
   # Restore only absent files. Existing state/config/key files are authoritative,
   # including an empty authorized_keys file representing deliberate revocation.
+  restore_host_keys "$release" || { rollback_created; return 1; }
   publish_absent "$release/tailscale/tailscaled.state" "$STATE_FILE" 600 "$SYSTEM_OWNER" ||
     { rollback_created; return 1; }
   publish_absent "$release/ssh/sshd_config" "$SSHD_CONFIG" "" "$SYSTEM_OWNER" ||
     { rollback_created; return 1; }
-  restore_host_keys "$release" || { rollback_created; return 1; }
   publish_absent "$release/box-ssh/authorized_keys" "$AUTHORIZED_KEYS" 600 \
     "${RECOVERY_USER_OWNER:-$(id -un):$(id -gn)}" || { rollback_created; return 1; }
 
