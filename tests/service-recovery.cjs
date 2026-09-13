@@ -225,6 +225,9 @@ function tailscaleTests() {
   fs.unlinkSync(path.join(fixture.sshDir, 'ssh_host_ed25519_key'));
   fs.unlinkSync(path.join(fixture.sshDir, 'ssh_host_ed25519_key.pub'));
   write(fixture.boot, 'boot-d\n');
+  assert.notEqual(call('recover', {RECOVERY_SYSTEM_OWNER: 'no-such-user:no-such-group'}).status, 0);
+  assert.equal(fs.existsSync(fixture.state), false,
+    'failed privileged ownership must remove the partial restore');
   ok(call('recover'), 10);
   assert.match(fs.readFileSync(fixture.config, 'utf8'), /changed by user/);
   assert.match(fs.readFileSync(fixture.auth, 'utf8'), /replacement/);

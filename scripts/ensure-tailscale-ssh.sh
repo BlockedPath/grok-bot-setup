@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_HELPER="${RECOVERY_STATE_HELPER:-$SCRIPT_DIR/recovery-state.py}"
 MACHINE_ID_FILE="${RECOVERY_MACHINE_ID_FILE:-/etc/machine-id}"
 BOOT_ID_FILE="${RECOVERY_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
-MAX_AGE="${RECOVERY_PROVENANCE_MAX_AGE:-604800}"
+MAX_AGE="${RECOVERY_PROVENANCE_MAX_AGE:-86400}"
 
 TS_BIN="${TAILSCALE_BIN:-/usr/bin/tailscale}"
 TAILSCALED_BIN="${TAILSCALED_BIN:-/usr/sbin/tailscaled}"
@@ -223,8 +223,18 @@ restore_absent() {
   [[ -e "$target" ]] && return 0
   priv mkdir -p "$(dirname "$target")"
   priv cp -p "$source" "$target" || return
-  [[ -n "$mode" ]] && priv chmod "$mode" "$target"
-  [[ -n "$owner" ]] && priv chown "$owner" "$target"
+  if [[ -n "$mode" ]]; then
+    priv chmod "$mode" "$target" || {
+      priv rm -f "$target"
+      return 1
+    }
+  fi
+  if [[ -n "$owner" ]]; then
+    priv chown "$owner" "$target" || {
+      priv rm -f "$target"
+      return 1
+    }
+  fi
   RESTORED=1
   log "restored missing $target"
 }

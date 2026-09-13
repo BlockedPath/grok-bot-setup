@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_HELPER="${RECOVERY_STATE_HELPER:-$SCRIPT_DIR/recovery-state.py}"
 MACHINE_ID_FILE="${RECOVERY_MACHINE_ID_FILE:-/etc/machine-id}"
 BOOT_ID_FILE="${RECOVERY_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
-MAX_AGE="${RECOVERY_PROVENANCE_MAX_AGE:-604800}"
+MAX_AGE="${RECOVERY_PROVENANCE_MAX_AGE:-86400}"
 
 BIN="${MOSHI_BIN:-$HOME_DIR/.local/bin/moshi-hook}"
 CONFIG_DIR="${MOSHI_CONFIG_DIR:-$HOME_DIR/.config/moshi}"
@@ -124,7 +124,12 @@ restore_absent() {
   fi
   mkdir -p "$(dirname "$target")"
   cp -p "$source" "$target"
-  [[ -n "$mode" ]] && chmod "$mode" "$target"
+  if [[ -n "$mode" ]]; then
+    chmod "$mode" "$target" || {
+      rm -f "$target"
+      return 1
+    }
+  fi
   RESTORED=1
   log "restored missing $target"
 }

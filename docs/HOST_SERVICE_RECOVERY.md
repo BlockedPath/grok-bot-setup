@@ -65,7 +65,7 @@ adapters host-recovery recover
 ```
 
 Destructive restoration requires provenance from the same machine, a different
-boot ID, a matching checksummed release, and an age of at most seven days.
+boot ID, a matching checksummed release, and an age of at most 24 hours.
 The first recovery attempt claims the marker for that post-reset boot; retries
 on a later boot are rejected. Provenance is consumed after a successful health
 check.

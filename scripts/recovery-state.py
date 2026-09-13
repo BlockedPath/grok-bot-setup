@@ -263,7 +263,7 @@ def parser() -> argparse.ArgumentParser:
             sub.add_argument("--boot-id-file", required=True)
         if command in ("verify-provenance", "consume"):
             sub.add_argument("--provenance")
-            sub.add_argument("--max-age", type=int, default=7 * 24 * 60 * 60)
+            sub.add_argument("--max-age", type=int, default=24 * 60 * 60)
     return result
 
 
