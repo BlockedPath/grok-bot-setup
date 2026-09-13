@@ -14,6 +14,7 @@ MAX_AGE="${RECOVERY_PROVENANCE_MAX_AGE:-86400}"
 LOCK_TIMEOUT="${RECOVERY_LOCK_TIMEOUT:-30}"
 APPROVE_SENSITIVE="${GROK_APPROVE_SENSITIVE_RESTORE:-0}"
 DENY_FILE="${GROK_RECOVERY_DENY_FILE:-$HOME_DIR/.local/share/grok-bot-persist/.recovery-denied}"
+DENY_OWNER=component:moshi
 
 BIN="${MOSHI_BIN:-$HOME_DIR/.local/bin/moshi-hook}"
 CONFIG_DIR="${MOSHI_CONFIG_DIR:-$HOME_DIR/.config/moshi}"
@@ -22,6 +23,7 @@ SECRETS="$STATE_DIR/secrets.json"
 PAIRINGS="$CONFIG_DIR/host-pairings.json"
 RESTORED=0
 CREATED_TARGETS=()
+CREATED_IDENTITIES=()
 declare -A RESTORE_PLAN=()
 
 log() { printf '+ %s\n' "$*"; }
@@ -118,16 +120,23 @@ create_snapshot() {
 deny_recovery() {
   local temporary
   mkdir -p "$(dirname "$DENY_FILE")" || return 1
+  if [[ -e "$DENY_FILE" || -L "$DENY_FILE" ]]; then
+    [[ -f "$DENY_FILE" && "$(cat "$DENY_FILE" 2>/dev/null)" == "$DENY_OWNER" ]]
+    return
+  fi
   temporary="$(mktemp "$(dirname "$DENY_FILE")/.recovery-denied.XXXXXX")" || return 1
-  if ! printf 'preparation-incomplete\n' >"$temporary" ||
+  if ! printf '%s\n' "$DENY_OWNER" >"$temporary" ||
      ! chmod 600 "$temporary" ||
-     ! mv -f "$temporary" "$DENY_FILE"; then
+     ! ln "$temporary" "$DENY_FILE"; then
     rm -f "$temporary"
     return 1
   fi
+  rm -f "$temporary"
 }
 
 allow_recovery() {
+  [[ -f "$DENY_FILE" && "$(cat "$DENY_FILE" 2>/dev/null)" == "$DENY_OWNER" ]] ||
+    return 1
   rm -f "$DENY_FILE" || return 1
   [[ ! -e "$DENY_FILE" && ! -L "$DENY_FILE" ]]
 }
@@ -154,7 +163,12 @@ prepare_reset() {
   invalidate_reset || return
   create_snapshot || return
   arm_reset || return
-  allow_recovery || { fail "could not clear Moshi recovery deny marker"; return 1; }
+  allow_recovery || {
+    deny_recovery || true
+    invalidate_reset || true
+    fail "could not clear Moshi recovery deny marker"
+    return 1
+  }
 }
 
 release_for_recovery() {
@@ -198,11 +212,17 @@ publish_absent() {
   [[ "${RESTORE_PLAN[$target]:-0}" == "1" ]] || return 0
   local args=(publish --source "$source" --target "$target")
   [[ -n "$mode" ]] && args+=(--mode "$mode")
-  python3 "$STATE_HELPER" "${args[@]}" || {
+  local identity
+  identity="$(python3 "$STATE_HELPER" "${args[@]}")" || {
     fail "no-replace publication failed for $target"
     return 1
   }
+  [[ "$identity" =~ ^[0-9]+:[0-9]+:[0-9a-f]{64}$ ]] || {
+    fail "publisher returned invalid identity for $target"
+    return 1
+  }
   CREATED_TARGETS+=("$target")
+  CREATED_IDENTITIES+=("$identity")
   RESTORED=1
   log "restored missing $target"
 }
@@ -220,12 +240,15 @@ restore_optional_if_absent() {
 }
 
 rollback_created() {
-  local index target failed=0
+  local index target identity failed=0
   for ((index=${#CREATED_TARGETS[@]} - 1; index >= 0; index--)); do
     target="${CREATED_TARGETS[$index]}"
-    rm -f -- "$target" || failed=1
+    identity="${CREATED_IDENTITIES[$index]}"
+    python3 "$STATE_HELPER" remove-if-identity \
+      --target "$target" --identity "$identity" || failed=1
   done
   CREATED_TARGETS=()
+  CREATED_IDENTITIES=()
   [[ "$failed" -eq 0 ]] || fail "failed to roll back partial Moshi recovery"
 }
 

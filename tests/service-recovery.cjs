@@ -129,6 +129,11 @@ function moshiTests() {
     {env: {...env, ...extra}});
 
   ok(call('prepare-reset'));
+  write(deny, 'orchestrator\n', 0o600);
+  assert.notEqual(call('prepare-reset').status, 0);
+  assert.equal(fs.readFileSync(deny, 'utf8'), 'orchestrator\n',
+    'standalone component preparation must not clear an orchestrator deny');
+  fs.unlinkSync(deny);
   const lockResult = run('bash', ['-c', `
 (
   exec 8>"$MOSHI_PERSIST/.recovery.lock"
@@ -245,17 +250,24 @@ os.execv(sys.executable, [sys.executable, ${JSON.stringify(path.join(root, 'scri
     'sensitive Moshi deletion must require explicit approval before mutation');
   const failingHelper = path.join(dir, 'fail-optional-helper');
   write(failingHelper, `import os, sys
-if sys.argv[1] == "publish" and ${JSON.stringify(optionalHook)} in sys.argv:
-    os.makedirs(os.path.dirname(${JSON.stringify(optionalHook)}), exist_ok=True)
-    with open(${JSON.stringify(optionalHook)}, "w", encoding="utf-8") as output:
-        output.write('{"user":"concurrent"}\\n')
+if sys.argv[1] == "publish" and "--target" in sys.argv:
+    target = sys.argv[sys.argv.index("--target") + 1]
+    if target == ${JSON.stringify(secrets)}:
+        with open(${JSON.stringify(binary)}, "w", encoding="utf-8") as output:
+            output.write('#!/bin/sh\\n[ "$1" = status ] && echo "Status: paired"\\n')
+        os.chmod(${JSON.stringify(binary)}, 0o755)
+    if target == ${JSON.stringify(optionalHook)}:
+        os.makedirs(os.path.dirname(${JSON.stringify(optionalHook)}), exist_ok=True)
+        with open(${JSON.stringify(optionalHook)}, "w", encoding="utf-8") as output:
+            output.write('{"user":"concurrent"}\\n')
 os.execv(sys.executable, [sys.executable, ${JSON.stringify(path.join(root, 'scripts/recovery-state.py'))}, *sys.argv[1:]])
 `);
   assert.notEqual(call('recover', {
     GROK_APPROVE_SENSITIVE_RESTORE: '1',
     RECOVERY_STATE_HELPER: failingHelper,
   }).status, 0);
-  assert.equal(fs.existsSync(binary), false);
+  assert.equal(fs.readFileSync(binary, 'utf8').includes('Status: paired'), true,
+    'rollback must preserve a concurrently replaced published file');
   assert.equal(fs.existsSync(secrets), false,
     'optional hook publication failure must roll back earlier Moshi files');
   assert.equal(fs.readFileSync(optionalHook, 'utf8'), '{"user":"concurrent"}\n');
@@ -427,14 +439,36 @@ os.execv(sys.executable, [sys.executable, ${JSON.stringify(path.join(root, 'scri
   assert.match(fs.readFileSync(fixture.auth, 'utf8'), /replacement/);
   ok(call('recover'));
 
-  // A replacement host-key set is authoritative even when another file needs recovery.
+  // A host key removed during later file publication rolls those files back.
   write(fixture.boot, 'boot-e\n');
+  ok(call('prepare-reset'));
+  fs.unlinkSync(fixture.state);
+  write(fixture.boot, 'boot-f\n');
+  const lateRemovalHelper = path.join(fixture.dir, 'late-removal-helper');
+  write(lateRemovalHelper, `import os, sys
+if sys.argv[1] == "publish" and "--target" in sys.argv:
+    target = sys.argv[sys.argv.index("--target") + 1]
+    if target == ${JSON.stringify(fixture.state)}:
+        os.unlink(${JSON.stringify(path.join(fixture.sshDir, 'ssh_host_ed25519_key.pub'))})
+os.execv(sys.executable, [sys.executable, ${JSON.stringify(path.join(root, 'scripts/recovery-state.py'))}, *sys.argv[1:]])
+`);
+  assert.notEqual(call('recover', {
+    GROK_APPROVE_SENSITIVE_RESTORE: '1',
+    RECOVERY_STATE_HELPER: lateRemovalHelper,
+  }).status, 0);
+  assert.equal(fs.existsSync(fixture.state), false,
+    'late host-key removal must roll back newly restored state');
+  write(path.join(fixture.sshDir, 'ssh_host_ed25519_key.pub'), 'synthetic public\n');
+  write(fixture.state, 'synthetic tailscale state\n', 0o600);
+
+  // A replacement host-key set is authoritative even when another file needs recovery.
+  write(fixture.boot, 'boot-g\n');
   ok(call('prepare-reset'));
   fs.unlinkSync(path.join(fixture.sshDir, 'ssh_host_ed25519_key'));
   fs.unlinkSync(path.join(fixture.sshDir, 'ssh_host_ed25519_key.pub'));
   fs.mkdirSync(path.join(fixture.sshDir, 'ssh_host_ed25519_key'));
   fs.unlinkSync(fixture.state);
-  write(fixture.boot, 'boot-f\n');
+  write(fixture.boot, 'boot-h\n');
   assert.notEqual(call('recover', {GROK_APPROVE_SENSITIVE_RESTORE: '1'}).status, 0);
   assert.equal(fs.existsSync(fixture.state), false);
   assert.equal(fs.statSync(path.join(fixture.sshDir, 'ssh_host_ed25519_key')).isDirectory(), true);
@@ -451,7 +485,7 @@ os.execv(sys.executable, [sys.executable, ${JSON.stringify(path.join(root, 'scri
   write(fixture.state, 'synthetic tailscale state\n', 0o600);
   ok(call('prepare-reset'));
   fs.unlinkSync(path.join(fixture.sshDir, 'ssh_host_rsa_key.pub'));
-  write(fixture.boot, 'boot-g\n');
+  write(fixture.boot, 'boot-i\n');
   const partial = call('recover', {GROK_APPROVE_SENSITIVE_RESTORE: '1'});
   assert.notEqual(partial.status, 0);
   assert.equal(fs.existsSync(path.join(fixture.sshDir, 'ssh_host_rsa_key.pub')), false);

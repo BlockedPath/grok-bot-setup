@@ -14,6 +14,7 @@ MAX_AGE="${RECOVERY_PROVENANCE_MAX_AGE:-86400}"
 LOCK_TIMEOUT="${RECOVERY_LOCK_TIMEOUT:-30}"
 APPROVE_SENSITIVE="${GROK_APPROVE_SENSITIVE_RESTORE:-0}"
 DENY_FILE="${GROK_RECOVERY_DENY_FILE:-$HOME_DIR/.local/share/grok-bot-persist/.recovery-denied}"
+DENY_OWNER=component:tailscale-openssh
 
 TS_BIN="${TAILSCALE_BIN:-/usr/bin/tailscale}"
 TAILSCALED_BIN="${TAILSCALED_BIN:-/usr/sbin/tailscaled}"
@@ -26,6 +27,7 @@ AUTHORIZED_KEYS="${AUTHORIZED_KEYS_FILE:-$HOME_DIR/.ssh/authorized_keys}"
 SYSTEM_OWNER="${RECOVERY_SYSTEM_OWNER:-root:root}"
 RESTORED=0
 CREATED_TARGETS=()
+CREATED_IDENTITIES=()
 HOST_KEYS_ACTION=keep
 declare -A RESTORE_PLAN=()
 
@@ -214,16 +216,23 @@ create_snapshot() {
 deny_recovery() {
   local temporary
   mkdir -p "$(dirname "$DENY_FILE")" || return 1
+  if [[ -e "$DENY_FILE" || -L "$DENY_FILE" ]]; then
+    [[ -f "$DENY_FILE" && "$(cat "$DENY_FILE" 2>/dev/null)" == "$DENY_OWNER" ]]
+    return
+  fi
   temporary="$(mktemp "$(dirname "$DENY_FILE")/.recovery-denied.XXXXXX")" || return 1
-  if ! printf 'preparation-incomplete\n' >"$temporary" ||
+  if ! printf '%s\n' "$DENY_OWNER" >"$temporary" ||
      ! chmod 600 "$temporary" ||
-     ! mv -f "$temporary" "$DENY_FILE"; then
+     ! ln "$temporary" "$DENY_FILE"; then
     rm -f "$temporary"
     return 1
   fi
+  rm -f "$temporary"
 }
 
 allow_recovery() {
+  [[ -f "$DENY_FILE" && "$(cat "$DENY_FILE" 2>/dev/null)" == "$DENY_OWNER" ]] ||
+    return 1
   rm -f "$DENY_FILE" || return 1
   [[ ! -e "$DENY_FILE" && ! -L "$DENY_FILE" ]]
 }
@@ -250,7 +259,12 @@ prepare_reset() {
   invalidate_reset || return
   create_snapshot || return
   arm_reset || return
-  allow_recovery || { fail "could not clear Tailscale/OpenSSH recovery deny marker"; return 1; }
+  allow_recovery || {
+    deny_recovery || true
+    invalidate_reset || true
+    fail "could not clear Tailscale/OpenSSH recovery deny marker"
+    return 1
+  }
 }
 
 release_for_recovery() {
@@ -302,11 +316,17 @@ publish_absent() {
   local args=(publish --source "$source" --target "$target")
   [[ -n "$mode" ]] && args+=(--mode "$mode")
   [[ -n "$owner" ]] && args+=(--owner "$owner")
-  priv python3 "$STATE_HELPER" "${args[@]}" || {
+  local identity
+  identity="$(priv python3 "$STATE_HELPER" "${args[@]}")" || {
     fail "no-replace publication failed for $target"
     return 1
   }
+  [[ "$identity" =~ ^[0-9]+:[0-9]+:[0-9a-f]{64}$ ]] || {
+    fail "publisher returned invalid identity for $target"
+    return 1
+  }
   CREATED_TARGETS+=("$target")
+  CREATED_IDENTITIES+=("$identity")
   RESTORED=1
   log "restored missing $target"
 }
@@ -367,12 +387,15 @@ restore_host_keys() {
 }
 
 rollback_created() {
-  local index target failed=0
+  local index target identity failed=0
   for ((index=${#CREATED_TARGETS[@]} - 1; index >= 0; index--)); do
     target="${CREATED_TARGETS[$index]}"
-    priv rm -f -- "$target" || failed=1
+    identity="${CREATED_IDENTITIES[$index]}"
+    priv python3 "$STATE_HELPER" remove-if-identity \
+      --target "$target" --identity "$identity" || failed=1
   done
   CREATED_TARGETS=()
+  CREATED_IDENTITIES=()
   [[ "$failed" -eq 0 ]] || fail "failed to roll back partial Tailscale/OpenSSH recovery"
 }
 
@@ -428,6 +451,12 @@ recover() {
     { rollback_created; return 1; }
   publish_absent "$release/box-ssh/authorized_keys" "$AUTHORIZED_KEYS" 600 \
     "${RECOVERY_USER_OWNER:-$(id -un):$(id -gn)}" || { rollback_created; return 1; }
+  validate_host_keys_plan "$release" || { rollback_created; return 1; }
+  [[ "$HOST_KEYS_ACTION" == "keep" ]] || {
+    fail "OpenSSH host keys changed during file publication"
+    rollback_created
+    return 1
+  }
 
   if [[ "$(backend_state || true)" != "Running" ]]; then
     start_command "${TAILSCALED_START_CMD:-sudo systemctl start tailscaled}" tailscaled || {

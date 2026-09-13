@@ -9,6 +9,7 @@ HOME_DIR="${RECOVERY_HOME:-$HOME}"
 LOCK_TIMEOUT="${RECOVERY_LOCK_TIMEOUT:-30}"
 PERSIST_ROOT="${GROK_BOT_PERSIST_ROOT:-$HOME_DIR/.local/share/grok-bot-persist}"
 DENY_FILE="${GROK_RECOVERY_DENY_FILE:-$PERSIST_ROOT/.recovery-denied}"
+DENY_OWNER=orchestrator
 export GROK_RECOVERY_DENY_FILE="$DENY_FILE"
 RESTORED=0
 
@@ -77,17 +78,24 @@ preserve_runtime() {
 deny_recovery() {
   local temporary
   mkdir -p "$(dirname "$DENY_FILE")" || return 1
+  if [[ -e "$DENY_FILE" || -L "$DENY_FILE" ]]; then
+    [[ -f "$DENY_FILE" && "$(cat "$DENY_FILE" 2>/dev/null)" == "$DENY_OWNER" ]]
+    return
+  fi
   temporary="$(mktemp "$(dirname "$DENY_FILE")/.recovery-denied.XXXXXX")" || return 1
-  if ! printf 'preparation-incomplete\n' >"$temporary" ||
+  if ! printf '%s\n' "$DENY_OWNER" >"$temporary" ||
      ! chmod 600 "$temporary" ||
-     ! mv -f "$temporary" "$DENY_FILE"; then
+     ! ln "$temporary" "$DENY_FILE"; then
     rm -f "$temporary"
     return 1
   fi
+  rm -f "$temporary"
   [[ -f "$DENY_FILE" ]]
 }
 
 allow_recovery() {
+  [[ -f "$DENY_FILE" && "$(cat "$DENY_FILE" 2>/dev/null)" == "$DENY_OWNER" ]] ||
+    return 1
   rm -f "$DENY_FILE" || return 1
   [[ ! -e "$DENY_FILE" && ! -L "$DENY_FILE" ]]
 }
@@ -125,6 +133,8 @@ prepare_all() {
   }
   allow_recovery || {
     printf 'ERROR: reset markers armed but recovery deny marker could not be cleared\n' >&2
+    deny_recovery || true
+    invalidate_all || printf 'ERROR: failed to invalidate armed reset markers\n' >&2
     return 1
   }
   printf '+ all enabled host recovery snapshots prepared atomically\n'
