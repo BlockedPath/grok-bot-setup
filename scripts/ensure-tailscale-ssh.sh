@@ -27,6 +27,7 @@ SYSTEM_OWNER="${RECOVERY_SYSTEM_OWNER:-root:root}"
 RESTORED=0
 CREATED_TARGETS=()
 HOST_KEYS_ACTION=keep
+declare -A RESTORE_PLAN=()
 
 log() { printf '+ %s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
@@ -284,6 +285,11 @@ preflight_target() {
     fail "explicit approval required to restore deleted sensitive file: $target"
     return 1
   fi
+  if path_present "$target"; then
+    RESTORE_PLAN["$target"]=0
+  else
+    RESTORE_PLAN["$target"]=1
+  fi
 }
 
 publish_absent() {
@@ -292,7 +298,7 @@ publish_absent() {
     fail "validated snapshot is missing $source"
     return 1
   }
-  path_present "$target" && return 0
+  [[ "${RESTORE_PLAN[$target]:-0}" == "1" ]] || return 0
   local args=(publish --source "$source" --target "$target")
   [[ -n "$mode" ]] && args+=(--mode "$mode")
   [[ -n "$owner" ]] && args+=(--owner "$owner")

@@ -22,6 +22,7 @@ SECRETS="$STATE_DIR/secrets.json"
 PAIRINGS="$CONFIG_DIR/host-pairings.json"
 RESTORED=0
 CREATED_TARGETS=()
+declare -A RESTORE_PLAN=()
 
 log() { printf '+ %s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
@@ -181,6 +182,11 @@ preflight_target() {
     fail "explicit approval required to restore deleted sensitive file: $target"
     return 1
   fi
+  if path_present "$target"; then
+    RESTORE_PLAN["$target"]=0
+  else
+    RESTORE_PLAN["$target"]=1
+  fi
 }
 
 publish_absent() {
@@ -189,9 +195,7 @@ publish_absent() {
     fail "validated snapshot is missing $source"
     return 1
   }
-  if path_present "$target"; then
-    return 0
-  fi
+  [[ "${RESTORE_PLAN[$target]:-0}" == "1" ]] || return 0
   local args=(publish --source "$source" --target "$target")
   [[ -n "$mode" ]] && args+=(--mode "$mode")
   python3 "$STATE_HELPER" "${args[@]}" || {
@@ -206,7 +210,7 @@ publish_absent() {
 restore_optional_if_absent() {
   local release="$1" logical="$2" target="$3"
   [[ -f "$release/$logical" ]] || return 0
-  path_present "$target" && {
+  [[ "${RESTORE_PLAN[$target]:-0}" == "0" ]] && {
     if ! cmp -s "$release/$logical" "$target"; then
       log "preserved user-managed $target"
     fi
