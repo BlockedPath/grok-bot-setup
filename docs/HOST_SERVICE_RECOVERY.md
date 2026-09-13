@@ -101,6 +101,13 @@ and uses create-if-absent semantics; a concurrent file or dangling symlink is
 never followed or overwritten. The completed file is atomically published at
 its final name, so readers cannot observe an empty or partially copied target.
 
+Linux does not provide an atomic transaction across all of these independent
+paths. If an unrelated process changes a target after preflight, recovery
+stops; any files already published remain complete and checksummed. Recovery
+does not delete them by pathname during rollback, because a concurrent user
+replacement could otherwise be deleted. Re-run the monitor, inspect the
+reported paths, and retry only after resolving that interference.
+
 If needed, recovery starts tailscaled/OpenSSH/Moshi through their normal local
 service commands. It never invokes `tailscale up`. If `RunSSH` is true, it only
 issues `tailscale set --ssh=false` and then reads preferences again; a failed

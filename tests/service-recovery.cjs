@@ -165,6 +165,11 @@ os.execv(sys.executable, [sys.executable, ${JSON.stringify(path.join(root, 'scri
   });
   assert.notEqual(failed.status, 0);
   assert.doesNotMatch(failed.stdout, /validated Moshi snapshot/);
+  failed = call('snapshot', {
+    RECOVERY_STATE_HELPER: path.join(dir, 'missing-state-helper.py'),
+  });
+  assert.notEqual(failed.status, 0);
+  assert.doesNotMatch(failed.stdout, /validated Moshi snapshot/);
   fs.rmSync(helperLog);
   failed = call('prepare-reset', {
     RECOVERY_STATE_HELPER: failingStateHelper,
@@ -267,9 +272,9 @@ os.execv(sys.executable, [sys.executable, ${JSON.stringify(path.join(root, 'scri
     RECOVERY_STATE_HELPER: failingHelper,
   }).status, 0);
   assert.equal(fs.readFileSync(binary, 'utf8').includes('Status: paired'), true,
-    'rollback must preserve a concurrently replaced published file');
-  assert.equal(fs.existsSync(secrets), false,
-    'optional hook publication failure must roll back earlier Moshi files');
+    'failure handling must preserve a concurrently modified published file');
+  assert.equal(fs.readFileSync(secrets, 'utf8'), '{"pairing":"synthetic"}\n',
+    'earlier publications remain complete and are never unsafely deleted');
   assert.equal(fs.readFileSync(optionalHook, 'utf8'), '{"user":"concurrent"}\n');
   ok(call('recover', {GROK_APPROVE_SENSITIVE_RESTORE: '1'}), 10);
   assert.equal(fs.readFileSync(hook, 'utf8'), '{"user":"changed-after-snapshot"}\n');
@@ -425,8 +430,10 @@ os.execv(sys.executable, [sys.executable, ${JSON.stringify(path.join(root, 'scri
   }).status, 0);
   assert.equal(fs.existsSync(fixture.state), false);
   assert.equal(fs.existsSync(fixture.auth), false);
-  assert.equal(fs.existsSync(path.join(fixture.sshDir, 'ssh_host_ed25519_key')), false);
+  assert.equal(fs.readFileSync(
+    path.join(fixture.sshDir, 'ssh_host_ed25519_key'), 'utf8'), 'synthetic private\n');
   assert.equal(fs.readFileSync(concurrentPublic, 'utf8'), 'concurrent public key\n');
+  fs.unlinkSync(path.join(fixture.sshDir, 'ssh_host_ed25519_key'));
   fs.unlinkSync(concurrentPublic);
   assert.notEqual(call('recover', {
     GROK_APPROVE_SENSITIVE_RESTORE: '1',
@@ -456,10 +463,9 @@ os.execv(sys.executable, [sys.executable, ${JSON.stringify(path.join(root, 'scri
     GROK_APPROVE_SENSITIVE_RESTORE: '1',
     RECOVERY_STATE_HELPER: lateRemovalHelper,
   }).status, 0);
-  assert.equal(fs.existsSync(fixture.state), false,
-    'late host-key removal must roll back newly restored state');
+  assert.equal(fs.readFileSync(fixture.state, 'utf8'), 'synthetic tailscale state\n',
+    'late interference may leave only fully published files, never partial bytes');
   write(path.join(fixture.sshDir, 'ssh_host_ed25519_key.pub'), 'synthetic public\n');
-  write(fixture.state, 'synthetic tailscale state\n', 0o600);
 
   // A replacement host-key set is authoritative even when another file needs recovery.
   write(fixture.boot, 'boot-g\n');

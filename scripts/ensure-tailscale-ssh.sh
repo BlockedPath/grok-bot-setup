@@ -26,8 +26,6 @@ SSHD_CONFIG="${SSHD_CONFIG:-$SSH_DIR/sshd_config}"
 AUTHORIZED_KEYS="${AUTHORIZED_KEYS_FILE:-$HOME_DIR/.ssh/authorized_keys}"
 SYSTEM_OWNER="${RECOVERY_SYSTEM_OWNER:-root:root}"
 RESTORED=0
-CREATED_TARGETS=()
-CREATED_IDENTITIES=()
 HOST_KEYS_ACTION=keep
 declare -A RESTORE_PLAN=()
 
@@ -316,17 +314,10 @@ publish_absent() {
   local args=(publish --source "$source" --target "$target")
   [[ -n "$mode" ]] && args+=(--mode "$mode")
   [[ -n "$owner" ]] && args+=(--owner "$owner")
-  local identity
-  identity="$(priv python3 "$STATE_HELPER" "${args[@]}")" || {
+  priv python3 "$STATE_HELPER" "${args[@]}" >/dev/null || {
     fail "no-replace publication failed for $target"
     return 1
   }
-  [[ "$identity" =~ ^[0-9]+:[0-9]+:[0-9a-f]{64}$ ]] || {
-    fail "publisher returned invalid identity for $target"
-    return 1
-  }
-  CREATED_TARGETS+=("$target")
-  CREATED_IDENTITIES+=("$identity")
   RESTORED=1
   log "restored missing $target"
 }
@@ -386,19 +377,6 @@ restore_host_keys() {
   done
 }
 
-rollback_created() {
-  local index target identity failed=0
-  for ((index=${#CREATED_TARGETS[@]} - 1; index >= 0; index--)); do
-    target="${CREATED_TARGETS[$index]}"
-    identity="${CREATED_IDENTITIES[$index]}"
-    priv python3 "$STATE_HELPER" remove-if-identity \
-      --target "$target" --identity "$identity" || failed=1
-  done
-  CREATED_TARGETS=()
-  CREATED_IDENTITIES=()
-  [[ "$failed" -eq 0 ]] || fail "failed to roll back partial Tailscale/OpenSSH recovery"
-}
-
 preflight_recovery() {
   local release="$1"
   [[ -f "$release/tailscale/tailscaled.state" &&
@@ -444,17 +422,16 @@ recover() {
 
   # Restore only absent files. Existing state/config/key files are authoritative,
   # including an empty authorized_keys file representing deliberate revocation.
-  restore_host_keys "$release" || { rollback_created; return 1; }
+  restore_host_keys "$release" || return 1
   publish_absent "$release/tailscale/tailscaled.state" "$STATE_FILE" 600 "$SYSTEM_OWNER" ||
-    { rollback_created; return 1; }
+    return 1
   publish_absent "$release/ssh/sshd_config" "$SSHD_CONFIG" "" "$SYSTEM_OWNER" ||
-    { rollback_created; return 1; }
+    return 1
   publish_absent "$release/box-ssh/authorized_keys" "$AUTHORIZED_KEYS" 600 \
-    "${RECOVERY_USER_OWNER:-$(id -un):$(id -gn)}" || { rollback_created; return 1; }
-  validate_host_keys_plan "$release" || { rollback_created; return 1; }
+    "${RECOVERY_USER_OWNER:-$(id -un):$(id -gn)}" || return 1
+  validate_host_keys_plan "$release" || return 1
   [[ "$HOST_KEYS_ACTION" == "keep" ]] || {
     fail "OpenSSH host keys changed during file publication"
-    rollback_created
     return 1
   }
 

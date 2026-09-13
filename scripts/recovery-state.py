@@ -306,8 +306,6 @@ def cmd_publish(args: argparse.Namespace) -> None:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
-        published = target.stat()
-        print(f"{published.st_dev}:{published.st_ino}:{digest(target)}")
     except FileExistsError:
         print(f"PRESERVED: target already exists: {target}", file=sys.stderr)
         raise SystemExit(17)
@@ -326,22 +324,6 @@ def cmd_publish(args: argparse.Namespace) -> None:
                 pass
 
 
-def cmd_remove_if_identity(args: argparse.Namespace) -> None:
-    target = pathlib.Path(args.target)
-    try:
-        metadata = target.lstat()
-    except FileNotFoundError:
-        return
-    identity = f"{metadata.st_dev}:{metadata.st_ino}:{digest(target)}"
-    if target.is_symlink() or identity != args.identity:
-        print(f"PRESERVED: rollback target changed concurrently: {target}", file=sys.stderr)
-        return
-    try:
-        target.unlink()
-    except OSError as exc:
-        fail(f"cannot roll back published target {target}: {exc}")
-
-
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser()
     subparsers = result.add_subparsers(dest="command", required=True)
@@ -353,12 +335,11 @@ def parser() -> argparse.ArgumentParser:
         "consume",
         "invalidate-provenance",
         "publish",
-        "remove-if-identity",
     ):
         sub = subparsers.add_parser(command)
-        if command not in ("publish", "remove-if-identity"):
+        if command != "publish":
             sub.add_argument("--persist", required=True)
-        if command not in ("invalidate-provenance", "publish", "remove-if-identity"):
+        if command not in ("invalidate-provenance", "publish"):
             sub.add_argument("--component", required=True)
         if command == "create":
             sub.add_argument("--file", action="append", default=[])
@@ -373,9 +354,6 @@ def parser() -> argparse.ArgumentParser:
             sub.add_argument("--target", required=True)
             sub.add_argument("--mode")
             sub.add_argument("--owner")
-        if command == "remove-if-identity":
-            sub.add_argument("--target", required=True)
-            sub.add_argument("--identity", required=True)
     return result
 
 
@@ -389,7 +367,6 @@ def main() -> None:
         "consume": cmd_consume,
         "invalidate-provenance": cmd_invalidate,
         "publish": cmd_publish,
-        "remove-if-identity": cmd_remove_if_identity,
     }[args.command](args)
 
 

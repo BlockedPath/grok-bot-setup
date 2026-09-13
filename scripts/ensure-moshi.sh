@@ -22,8 +22,6 @@ STATE_DIR="${MOSHI_STATE_DIR:-$HOME_DIR/.local/state/moshi}"
 SECRETS="$STATE_DIR/secrets.json"
 PAIRINGS="$CONFIG_DIR/host-pairings.json"
 RESTORED=0
-CREATED_TARGETS=()
-CREATED_IDENTITIES=()
 declare -A RESTORE_PLAN=()
 
 log() { printf '+ %s\n' "$*"; }
@@ -212,17 +210,10 @@ publish_absent() {
   [[ "${RESTORE_PLAN[$target]:-0}" == "1" ]] || return 0
   local args=(publish --source "$source" --target "$target")
   [[ -n "$mode" ]] && args+=(--mode "$mode")
-  local identity
-  identity="$(python3 "$STATE_HELPER" "${args[@]}")" || {
+  python3 "$STATE_HELPER" "${args[@]}" >/dev/null || {
     fail "no-replace publication failed for $target"
     return 1
   }
-  [[ "$identity" =~ ^[0-9]+:[0-9]+:[0-9a-f]{64}$ ]] || {
-    fail "publisher returned invalid identity for $target"
-    return 1
-  }
-  CREATED_TARGETS+=("$target")
-  CREATED_IDENTITIES+=("$identity")
   RESTORED=1
   log "restored missing $target"
 }
@@ -237,19 +228,6 @@ restore_optional_if_absent() {
     return 0
   }
   publish_absent "$release/$logical" "$target"
-}
-
-rollback_created() {
-  local index target identity failed=0
-  for ((index=${#CREATED_TARGETS[@]} - 1; index >= 0; index--)); do
-    target="${CREATED_TARGETS[$index]}"
-    identity="${CREATED_IDENTITIES[$index]}"
-    python3 "$STATE_HELPER" remove-if-identity \
-      --target "$target" --identity "$identity" || failed=1
-  done
-  CREATED_TARGETS=()
-  CREATED_IDENTITIES=()
-  [[ "$failed" -eq 0 ]] || fail "failed to roll back partial Moshi recovery"
 }
 
 preflight_recovery() {
@@ -325,9 +303,9 @@ recover() {
 
   # Existing files are never replaced. Invalid existing pairing data therefore
   # fails the final check instead of being silently replaced by an old pairing.
-  publish_absent "$release/bin/moshi-hook" "$BIN" 755 || { rollback_created; return 1; }
-  publish_absent "$release/state/secrets.json" "$SECRETS" 600 || { rollback_created; return 1; }
-  publish_absent "$release/config/host-pairings.json" "$PAIRINGS" 600 || { rollback_created; return 1; }
+  publish_absent "$release/bin/moshi-hook" "$BIN" 755 || return 1
+  publish_absent "$release/state/secrets.json" "$SECRETS" 600 || return 1
+  publish_absent "$release/config/host-pairings.json" "$PAIRINGS" 600 || return 1
 
   local file
   if [[ -d "$release/config" ]]; then
@@ -335,14 +313,14 @@ recover() {
       [[ -f "$file" ]] || continue
       [[ "$(basename "$file")" == "host-pairings.json" ]] && continue
       restore_optional_if_absent "$release" "config/$(basename "$file")" \
-        "$CONFIG_DIR/$(basename "$file")" || { rollback_created; return 1; }
+        "$CONFIG_DIR/$(basename "$file")" || return 1
     done
   fi
-  restore_optional_if_absent "$release" hooks/cursor-hooks.json "$HOME_DIR/.cursor/hooks.json" || { rollback_created; return 1; }
-  restore_optional_if_absent "$release" hooks/grok-moshi-hooks.json "$HOME_DIR/.grok/hooks/moshi-hooks.json" || { rollback_created; return 1; }
-  restore_optional_if_absent "$release" hooks/pi-moshi-hooks.ts "$HOME_DIR/.pi/agent/extensions/moshi-hooks.ts" || { rollback_created; return 1; }
-  restore_optional_if_absent "$release" hooks/claude-settings.json "$HOME_DIR/.claude/settings.json" || { rollback_created; return 1; }
-  restore_optional_if_absent "$release" hooks/codex-hooks.json "$HOME_DIR/.codex/hooks.json" || { rollback_created; return 1; }
+  restore_optional_if_absent "$release" hooks/cursor-hooks.json "$HOME_DIR/.cursor/hooks.json" || return 1
+  restore_optional_if_absent "$release" hooks/grok-moshi-hooks.json "$HOME_DIR/.grok/hooks/moshi-hooks.json" || return 1
+  restore_optional_if_absent "$release" hooks/pi-moshi-hooks.ts "$HOME_DIR/.pi/agent/extensions/moshi-hooks.ts" || return 1
+  restore_optional_if_absent "$release" hooks/claude-settings.json "$HOME_DIR/.claude/settings.json" || return 1
+  restore_optional_if_absent "$release" hooks/codex-hooks.json "$HOME_DIR/.codex/hooks.json" || return 1
 
   start_daemon_if_needed || {
     fail "Moshi daemon could not be restored"
