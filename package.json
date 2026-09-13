@@ -36,11 +36,17 @@
     "scripts/verify-tool-patch.sh",
     "scripts/preserve-tool-contracts.sh",
     "scripts/restore-tool-contracts.sh",
+    "scripts/recovery-state.py",
+    "scripts/recover-host-services.sh",
+    "scripts/ensure-moshi.sh",
+    "scripts/ensure-tailscale-ssh.sh",
     "tests/machine-id.cjs",
     "tests/end-turn.cjs",
     "tests/recovery.cjs",
+    "tests/service-recovery.cjs",
     "tests/host-machine-id.cjs",
     "docs/TOOL_FIX_RECOVERY.md",
+    "docs/HOST_SERVICE_RECOVERY.md",
     "examples/cliproxy-openai-compat.yaml",
     "docs/GUIDE_CUSTOM_INFERENCE.md",
     "README.md",
@@ -61,7 +67,7 @@
   "scripts": {
     "adapters": "bash ./adapters.sh",
     "prepack": "test -x adapters.sh",
-    "test": "bash -n adapters.sh && bash -n adapters && bash -n scripts/ensure-xai-inference.sh && bash -n scripts/restore-after-reset.sh && bash -n scripts/bootstrap.sh && bash ./adapters.sh help >/dev/null && node tests/machine-id.cjs && node tests/end-turn.cjs && node tests/recovery.cjs",
+    "test": "bash -n adapters.sh && bash -n adapters && bash -n scripts/*.sh && python3 -m py_compile scripts/recovery-state.py && bash ./adapters.sh help >/dev/null && node tests/machine-id.cjs && node tests/end-turn.cjs && node tests/recovery.cjs && node tests/service-recovery.cjs",
     "test:host-machine-id": "node tests/host-machine-id.cjs"
   }
 }
