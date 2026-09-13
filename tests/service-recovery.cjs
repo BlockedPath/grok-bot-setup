@@ -83,6 +83,24 @@ function moshiTests() {
   write(secrets, '{"pairing":"synthetic"}\n', 0o600);
   ok(call('prepare-reset'));
 
+  const provenancePath = path.join(persist, 'reset-provenance.json');
+  const provenance = JSON.parse(fs.readFileSync(provenancePath, 'utf8'));
+  const verifyProvenance = () => run('python3', [
+    path.join(root, 'scripts/recovery-state.py'), 'verify-provenance',
+    '--component', 'moshi', '--persist', persist,
+    '--machine-id-file', machine, '--boot-id-file', boot,
+  ], {env: safeEnv});
+  write(boot, 'boot-probe\n');
+  write(machine, 'different-machine\n');
+  assert.notEqual(verifyProvenance().status, 0);
+  write(machine, 'machine-a\n');
+  write(provenancePath, `${JSON.stringify({...provenance, created_at: 0})}\n`);
+  assert.notEqual(verifyProvenance().status, 0);
+  write(provenancePath,
+    `${JSON.stringify({...provenance, created_at: Math.floor(Date.now() / 1000) + 3600})}\n`);
+  assert.notEqual(verifyProvenance().status, 0);
+  write(provenancePath, `${JSON.stringify(provenance)}\n`);
+
   write(boot, 'boot-b\n');
   fs.unlinkSync(binary);
   fs.unlinkSync(secrets);
@@ -158,6 +176,7 @@ echo 'State Recv-Q Send-Q Local Address:Port Peer Address:Port'
     SSHD_CONFIG: config,
     AUTHORIZED_KEYS_FILE: auth,
     RECOVERY_NO_SUDO: '1',
+    RECOVERY_SYSTEM_OWNER: `${process.getuid()}:${process.getgid()}`,
     MOCK_PREFS: prefs,
     MOCK_BACKEND: backend,
     MOCK_LISTENING: listening,
@@ -211,14 +230,26 @@ function tailscaleTests() {
   assert.match(fs.readFileSync(fixture.auth, 'utf8'), /replacement/);
   ok(call('recover'));
 
-  // A partial host-key set is not silently completed from a historical set.
+  // A replacement host-key set is authoritative even when another file needs recovery.
   write(fixture.boot, 'boot-e\n');
   ok(call('prepare-reset'));
+  fs.unlinkSync(path.join(fixture.sshDir, 'ssh_host_ed25519_key'));
   fs.unlinkSync(path.join(fixture.sshDir, 'ssh_host_ed25519_key.pub'));
+  write(path.join(fixture.sshDir, 'ssh_host_rsa_key'), 'replacement private\n', 0o600);
+  write(path.join(fixture.sshDir, 'ssh_host_rsa_key.pub'), 'replacement public\n');
+  fs.unlinkSync(fixture.state);
   write(fixture.boot, 'boot-f\n');
+  assert.notEqual(call('recover').status, 0);
+  assert.equal(fs.existsSync(path.join(fixture.sshDir, 'ssh_host_ed25519_key')), false);
+  assert.equal(fs.existsSync(path.join(fixture.sshDir, 'ssh_host_rsa_key')), true);
+
+  // A partial host-key set is not silently completed from a historical set.
+  ok(call('prepare-reset'));
+  fs.unlinkSync(path.join(fixture.sshDir, 'ssh_host_rsa_key.pub'));
+  write(fixture.boot, 'boot-g\n');
   const partial = call('recover');
   assert.notEqual(partial.status, 0);
-  assert.equal(fs.existsSync(path.join(fixture.sshDir, 'ssh_host_ed25519_key.pub')), false);
+  assert.equal(fs.existsSync(path.join(fixture.sshDir, 'ssh_host_rsa_key.pub')), false);
   console.log('PASS: SSH keys/config preserve user intent; RunSSH=false is verified; partial state fails');
 }
 

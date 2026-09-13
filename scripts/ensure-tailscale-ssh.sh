@@ -20,6 +20,7 @@ STATE_FILE="${TAILSCALE_STATE_FILE:-/var/lib/tailscale/tailscaled.state}"
 SSH_DIR="${OPENSSH_CONFIG_DIR:-/etc/ssh}"
 SSHD_CONFIG="${SSHD_CONFIG:-$SSH_DIR/sshd_config}"
 AUTHORIZED_KEYS="${AUTHORIZED_KEYS_FILE:-$HOME_DIR/.ssh/authorized_keys}"
+SYSTEM_OWNER="${RECOVERY_SYSTEM_OWNER:-root:root}"
 RESTORED=0
 
 log() { printf '+ %s\n' "$*"; }
@@ -251,7 +252,7 @@ restore_host_keys() {
   fi
   if [[ "$live_count" -eq 0 ]]; then
     for file in "${snapshot_keys[@]}"; do
-      restore_absent "$file" "$SSH_DIR/$(basename "$file")" || return
+      restore_absent "$file" "$SSH_DIR/$(basename "$file")" "" "$SYSTEM_OWNER" || return
     done
   fi
 }
@@ -283,8 +284,8 @@ recover() {
 
   # Restore only absent files. Existing state/config/key files are authoritative,
   # including an empty authorized_keys file representing deliberate revocation.
-  restore_absent "$release/tailscale/tailscaled.state" "$STATE_FILE" 600 || return
-  restore_absent "$release/ssh/sshd_config" "$SSHD_CONFIG" || return
+  restore_absent "$release/tailscale/tailscaled.state" "$STATE_FILE" 600 "$SYSTEM_OWNER" || return
+  restore_absent "$release/ssh/sshd_config" "$SSHD_CONFIG" "" "$SYSTEM_OWNER" || return
   restore_host_keys "$release" || return
   restore_absent "$release/box-ssh/authorized_keys" "$AUTHORIZED_KEYS" 600 \
     "${RECOVERY_USER:-$(id -un)}" || return

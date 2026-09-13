@@ -204,7 +204,12 @@ def validated_provenance(
     if provenance.get("schema") != SCHEMA or provenance.get("component") != args.component:
         fail(f"reset provenance does not describe {args.component}")
     created_at = provenance.get("created_at")
-    if not isinstance(created_at, int) or time.time() - created_at > args.max_age:
+    now = time.time()
+    if (
+        not isinstance(created_at, int)
+        or created_at > now + 300
+        or now - created_at > args.max_age
+    ):
         fail("reset provenance is stale")
     machine_hash = hashlib.sha256(
         read_identity(args.machine_id_file, "machine id").encode()
